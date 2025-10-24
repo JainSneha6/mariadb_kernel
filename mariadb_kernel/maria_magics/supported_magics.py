@@ -12,7 +12,7 @@ from mariadb_kernel.maria_magics.pie import Pie
 from mariadb_kernel.maria_magics.delimiter import Delimiter
 from mariadb_kernel.maria_magics.load import Load
 from mariadb_kernel.maria_magics.missing import Missing
-
+from mariadb_kernel.maria_magics.dropmissing import DropMissing
 
 def get():
     return {
@@ -24,4 +24,5 @@ def get():
         "delimiter": Delimiter,
         "load": Load,
         "missing": Missing,
+        "dropmissing": DropMissing 
     }
