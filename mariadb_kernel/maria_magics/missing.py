@@ -22,6 +22,21 @@ class Missing(MariaMagic):
       %missing SELECT id, name, val FROM ... WHERE ...
     """
 
+    def __init__(self, *args, **kwargs):
+        """
+        Accept any constructor arguments to match how other magics are
+        instantiated (lsmagic passes a string). We ignore them but keep
+        them for possible debugging.
+        """
+        # If MariaMagic or other parents later implement __init__, call it.
+        try:
+            super().__init__()
+        except TypeError:
+            # parent may not accept __init__; ignore
+            pass
+        self._ctor_args = args
+        self._ctor_kwargs = kwargs
+
     def name(self):
         return "missing"
 
