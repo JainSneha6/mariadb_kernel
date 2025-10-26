@@ -18,6 +18,7 @@ from mariadb_kernel.maria_magics.ml_commands.data_cleaning.fillmissing import Fi
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.outliers import Outliers
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.dropoutliers import DropOutliers
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.clipoutliers import ClipOutliers
+from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.encode import Encode
 
 def get():
     return {
@@ -35,4 +36,5 @@ def get():
         "outliers": Outliers,
         "dropoutliers": DropOutliers,
         "clipoutliers": ClipOutliers,
+        "encode": Encode,
     }
