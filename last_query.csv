@@ -1,7 +1,9 @@
-month,sales
-Jan,10
-Feb,20
-Mar,15
-Apr,30
-May,22
-Jun,18
+id,name,department,age,salary
+1,Alice,HR,30.0,50000.0
+2,Bob,Unknown,40.0,61000.0
+3,Charlie,Engineering,36.142857142857146,70000.0
+4,David,HR,25.0,48000.0
+5,Eve,Unknown,35.0,61000.0
+6,Frank,Engineering,28.0,72000.0
+7,Unknown,Sales,50.0,61000.0
+8,Grace,Sales,45.0,65000.0

@@ -11,9 +11,10 @@ from mariadb_kernel.maria_magics.bar import Bar
 from mariadb_kernel.maria_magics.pie import Pie
 from mariadb_kernel.maria_magics.delimiter import Delimiter
 from mariadb_kernel.maria_magics.load import Load
-from mariadb_kernel.maria_magics.missing import Missing
-from mariadb_kernel.maria_magics.dropmissing import DropMissing
-from mariadb_kernel.maria_magics.stats import Stats
+from mariadb_kernel.maria_magics.ml_commands.data_cleaning.missing import Missing
+from mariadb_kernel.maria_magics.ml_commands.data_cleaning.dropmissing import DropMissing
+from mariadb_kernel.maria_magics.ml_commands.data_cleaning.stats import Stats
+from mariadb_kernel.maria_magics.ml_commands.data_cleaning.fillmissing import FillMissing
 
 def get():
     return {
@@ -27,4 +28,5 @@ def get():
         "missing": Missing,
         "dropmissing": DropMissing,
         "stats": Stats,
+        "fillmissing": FillMissing,
     }
