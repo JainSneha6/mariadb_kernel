@@ -16,6 +16,8 @@ from mariadb_kernel.maria_magics.ml_commands.data_cleaning.dropmissing import Dr
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.stats import Stats
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.fillmissing import FillMissing
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.outliers import Outliers
+from mariadb_kernel.maria_magics.ml_commands.data_cleaning.dropoutliers import DropOutliers
+from mariadb_kernel.maria_magics.ml_commands.data_cleaning.clipoutliers import ClipOutliers
 
 def get():
     return {
@@ -31,4 +33,6 @@ def get():
         "stats": Stats,
         "fillmissing": FillMissing,
         "outliers": Outliers,
+        "dropoutliers": DropOutliers,
+        "clipoutliers": ClipOutliers,
     }
