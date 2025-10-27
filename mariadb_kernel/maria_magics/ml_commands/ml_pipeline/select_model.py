@@ -11,7 +11,7 @@ from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge, La
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor, AdaBoostClassifier, AdaBoostRegressor
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-from sklearn.neural_network import MLPClassifier, MLPRegresso
+from sklearn.neural_network import MLPClassifier
 
 _XGBOOST_AVAILABLE = False
 _LIGHTGBM_AVAILABLE = False
