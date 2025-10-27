@@ -6,17 +6,13 @@ import shlex
 from distutils import util
 import pandas as pd
 import numpy as np
-import joblib
-import json
-
 from sklearn.model_selection import cross_val_score
 from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge, Lasso
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor, AdaBoostClassifier, AdaBoostRegressor
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-from sklearn.neural_network import MLPClassifier, MLPRegressor
+from sklearn.neural_network import MLPClassifier, MLPRegresso
 
-# Optional external libraries
 _XGBOOST_AVAILABLE = False
 _LIGHTGBM_AVAILABLE = False
 _CATBOOST_AVAILABLE = False
@@ -38,16 +34,17 @@ try:
 except Exception:
     pass
 
-
-class TrainModel(MariaMagic):
+class SelectModel(MariaMagic):
     """
-    %train_model model=<name> features=col1,col2 target=target_col
-                 [cv=0] [problem=classification|regression]
-                 [model_name=last_model] [pred_name=last_preds] [test_name=last_select_test]
-                 [save_path=/path/to/model.joblib] [inplace=True|False] [model_params={'n':1}]
+    %select_model features=col1,col2 target=target_col
+                  [models=rf,logistic,svm] [cv=5] [metric=accuracy|r2|f1|precision|recall|mse|mae]
+                  [problem=classification|regression] [output_name=best_model]
+                  [inplace=True|False] [model_params={'rf': {'n_estimators': 100}, 'logistic': {'C': 1.0}}]
 
-    Train a model on data["last_select"] (TRAINING set). This magic DOES NOT perform
-    splitting or scaling — run your preprocessing and %splitdata beforehand.
+    Select the best model by comparing multiple models on data['last_select'] using cross-validation.
+    Models: logistic, rf, svm, knn, gbm, ada, mlp, xgboost, lightgbm, catboost (classification);
+            linear, ridge, lasso, rf, knn, gbm, ada, mlp, xgboost, lightgbm, catboost (regression).
+    Stores the best model in data[output_name] and displays a table of model performances.
     """
     def __init__(self, args=""):
         self.args = args
@@ -56,13 +53,12 @@ class TrainModel(MariaMagic):
         return "Line"
 
     def name(self):
-        return "train_model"
+        return "select_model"
 
     def help(self):
-        return "Train a model on data['last_select'] (no split or scaling)."
+        return "Select the best model for training from data['last_select'] using cross-validation."
 
     def _str_to_obj(self, s):
-        # try int/float/bool, then JSON, then string unquote
         try:
             return int(s)
         except Exception:
@@ -75,12 +71,11 @@ class TrainModel(MariaMagic):
             return bool(util.strtobool(s))
         except Exception:
             pass
-        # try json
         try:
+            import json
             return json.loads(s)
         except Exception:
             pass
-        # strip quotes
         if isinstance(s, str) and len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
             return s[1:-1]
         return s
@@ -99,14 +94,14 @@ class TrainModel(MariaMagic):
             if title:
                 html = f"<h4>{title}</h4>" + html
             kernel.send_response(kernel.iopub_socket, "display_data",
-                                 {"data": {"text/html": html}, "metadata": {}})
+                                {"data": {"text/html": html}, "metadata": {}})
         except Exception:
             pass
 
     def _choose_model(self, name, problem, params=None):
+        # Reuse TrainModel's model selection logic
         p = params or {}
         name = name.lower()
-        # Classification vs regression models where appropriate
         if name in ("logistic", "logistic_regression", "lr"):
             if problem != "classification":
                 raise ValueError("LogisticRegression is for classification problems.")
@@ -148,7 +143,6 @@ class TrainModel(MariaMagic):
         if name == "catboost":
             if not _CATBOOST_AVAILABLE:
                 raise ImportError("catboost not available in this environment.")
-            # CatBoost often prints to stdout; keep default verbose False
             p = dict(p)
             p.setdefault("verbose", False)
             return CatBoostClassifier(**p) if problem == "classification" else CatBoostRegressor(**p)
@@ -158,7 +152,7 @@ class TrainModel(MariaMagic):
         # Load training DataFrame
         df = data.get("last_select")
         if df is None or df.empty:
-            kernel._send_message("stderr", "No last_select found or DataFrame is empty (training set required).")
+            kernel._send_message("stderr", "No last_select found or DataFrame is empty.")
             return
 
         try:
@@ -169,12 +163,11 @@ class TrainModel(MariaMagic):
 
         features_arg = args.get("features")
         target = args.get("target")
-        model_name_arg = args.get("model", "rf")
-        cv = int(args.get("cv", 0) or 0)
+        models_arg = args.get("models", "rf,logistic,knn")  # Default models
+        cv = int(args.get("cv", 5) or 5)
+        metric = args.get("metric", None)
         problem_override = args.get("problem", None)
-        test_name = args.get("test_name", "last_select_test")
-        model_store_name = args.get("model_name", "last_model")
-        # pred_name and save_path intentionally ignored/removed
+        output_name = args.get("output_name", "best_model")
         inplace = bool(args.get("inplace", True))
         model_params = args.get("model_params", {}) or {}
 
@@ -185,7 +178,7 @@ class TrainModel(MariaMagic):
             kernel._send_message("stderr", "target argument is required (target=target_col).")
             return
 
-        # parse features
+        # Parse features
         if isinstance(features_arg, str):
             features = [c.strip() for c in features_arg.split(",") if c.strip()]
         elif isinstance(features_arg, (list, tuple)):
@@ -194,100 +187,141 @@ class TrainModel(MariaMagic):
             kernel._send_message("stderr", "features must be comma-separated string or list.")
             return
 
-        missing = [c for c in features + [target] if c not in df.columns]
-        if missing:
-            kernel._send_message("stderr", f"Missing columns in training DataFrame: {', '.join(missing)}")
+        # Parse models
+        if isinstance(models_arg, str):
+            models = [m.strip() for m in models_arg.split(",") if m.strip()]
+        elif isinstance(models_arg, (list, tuple)):
+            models = list(models_arg)
+        else:
+            kernel._send_message("stderr", "models must be comma-separated string or list.")
             return
 
-        # Determine problem type
+        missing = [c for c in features + [target] if c not in df.columns]
+        if missing:
+            kernel._send_message("stderr", f"Missing columns in DataFrame: {', '.join(missing)}")
+            return
+
+        # Determine problem type (same logic as TrainModel)
         if problem_override:
             problem = problem_override.lower()
             if problem not in ("classification", "regression"):
                 kernel._send_message("stderr", "problem must be 'classification' or 'regression'.")
                 return
         else:
-            # improved heuristic for problem detection
             tgt_ser = df[target]
-
             if pd.api.types.is_numeric_dtype(tgt_ser):
                 nunique = int(tgt_ser.nunique(dropna=True))
                 non_null_count = max(1, len(tgt_ser.dropna()))
                 uniq_prop = nunique / non_null_count
-
-                # treat as regression if:
-                #  - float dtype, or
-                #  - many distinct values (>20), or
-                #  - distinct proportion high (e.g. >5% of rows)
-                if pd.api.types.is_float_dtype(tgt_ser) or (nunique > 20) or (uniq_prop > 0.05):
+                if pd.api.types.is_float_dtype(tgt_ser) or nunique > 20 or uniq_prop > 0.05:
                     problem = "regression"
                 else:
-                    # few distinct integer-like values -> classification (categorical target)
                     problem = "classification"
             else:
                 problem = "classification"
 
-        # Prepare X_train, y_train
-        X_train = df[features].copy()
-        y_train = df[target].copy()
-
-        # NOTE: test set (if present) will be ignored in this modified flow — no predictions or metrics.
-        # Keep reading test_df only to validate presence but do not use it.
-        test_df = data.get(test_name)
-        if isinstance(test_df, pd.DataFrame) and not test_df.empty:
-            missing_test = [c for c in features + [target] if c not in test_df.columns]
-            if missing_test:
-                kernel._send_message("stderr", f"Test DataFrame '{test_name}' missing columns: {', '.join(missing_test)}")
-                return
-
-        # Instantiate model
-        try:
-            model = self._choose_model(model_name_arg, problem, params=model_params)
-        except Exception as e:
-            kernel._send_message("stderr", f"Error creating model: {e}")
+        # Validate metric
+        valid_metrics = {
+            "classification": ["accuracy", "f1", "precision", "recall"],
+            "regression": ["r2", "mse", "mae"]
+        }
+        if metric is None:
+            metric = "accuracy" if problem == "classification" else "r2"
+        if metric not in valid_metrics[problem]:
+            kernel._send_message("stderr", f"Invalid metric '{metric}' for {problem}. Choose from {', '.join(valid_metrics[problem])}.")
             return
 
-        # Cross-validation on training set if requested (kept)
-        cv_results = None
-        if cv and cv > 1:
+        # Prepare data
+        X = df[features].copy()
+        y = df[target].copy()
+
+        # Handle missing values (simple imputation)
+        X = X.fillna(X.mean(numeric_only=True)) if problem == "regression" else X.fillna(X.mode().iloc[0])
+        if X.isna().any().any():
+            kernel._send_message("stderr", "Features contain non-numeric data or unhandled missing values.")
+            return
+
+        # Evaluate models
+        results = []
+        best_model = None
+        best_score = -float("inf") if metric not in ("mse", "mae") else float("inf")
+        best_model_name = None
+
+        for model_name in models:
             try:
-                scoring = "accuracy" if problem == "classification" else "r2"
-                cv_results = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring)
+                # Get model-specific parameters
+                params = model_params.get(model_name, {}) if isinstance(model_params, dict) else {}
+                model = self._choose_model(model_name, problem, params)
+                scoring = metric if metric in ("accuracy", "f1", "precision", "recall", "r2") else (
+                    "neg_mean_squared_error" if metric == "mse" else "neg_mean_absolute_error"
+                )
+                cv_scores = cross_val_score(model, X, y, cv=cv, scoring=scoring)
+                mean_score = np.mean(cv_scores)
+                std_score = np.std(cv_scores)
+
+                # Adjust score for negative metrics (mse, mae)
+                if metric in ("mse", "mae"):
+                    mean_score = -mean_score  # Convert back to positive for reporting
+
+                results.append({
+                    "Model": model_name,
+                    "Mean_Score": mean_score,
+                    "Std_Score": std_score
+                })
+
+                # Update best model (maximize for accuracy, f1, precision, recall, r2; minimize for mse, mae)
+                if metric in ("mse", "mae"):
+                    if mean_score < best_score:
+                        best_score = mean_score
+                        best_model = model
+                        best_model_name = model_name
+                else:
+                    if mean_score > best_score:
+                        best_score = mean_score
+                        best_model = model
+                        best_model_name = model_name
+
             except Exception as e:
-                kernel._send_message("stderr", f"Error during cross-validation: {e}")
-                return
+                kernel._send_message("stderr", f"Error evaluating model '{model_name}': {e}")
+                continue
 
-        # Fit
-        try:
-            model.fit(X_train, y_train)
-        except Exception as e:
-            kernel._send_message("stderr", f"Error fitting model: {e}")
+        if not results:
+            kernel._send_message("stderr", "No models were successfully evaluated.")
             return
 
-        # Store only the trained model and minimal meta (no preds, no metrics, no joblib saving)
+        # Create results DataFrame
+        result_df = pd.DataFrame(results).sort_values("Mean_Score", ascending=metric in ("mse", "mae"))
+        result_df["Mean_Score"] = result_df["Mean_Score"].round(4)
+        result_df["Std_Score"] = result_df["Std_Score"].round(4)
+
+        # Fit the best model on the full training data
         try:
-            data[model_store_name] = model
-
-            # Save metadata including target so evaluate_model can find it
-            meta = data.setdefault(model_store_name + "_meta", {})
-            meta["problem"] = problem
-            meta["features"] = features
-            meta["target"] = target
-
-            # If model exposes classes_, save them for easier decoding later
-            if hasattr(model, "classes_"):
-                try:
-                    meta["classes"] = list(getattr(model, "classes_"))
-                except Exception:
-                    pass
-
+            best_model.fit(X, y)
         except Exception as e:
-            kernel._send_message("stderr", f"Error storing model: {e}")
+            kernel._send_message("stderr", f"Error fitting best model '{best_model_name}': {e}")
             return
 
-        # Output concise summary
-        out_lines = [f"Model '{model_name_arg}' trained and saved to data['{model_store_name}']. problem={problem}. train_rows={len(X_train)}"]
-        if cv_results is not None:
-            out_lines.append(f"cross-val (cv={cv}) scores: mean={float(np.mean(cv_results)):.4f}, std={float(np.std(cv_results)):.4f}")
-        kernel._send_message("stdout", "\n".join(out_lines))
+        # Store the best model and metadata
+        try:
+            data[output_name] = best_model
+            data[output_name + "_meta"] = {
+                "model_name": best_model_name,
+                "problem": problem,
+                "features": features,
+                "target": target,
+                "metric": metric,
+                "cv": cv,
+                "score": float(best_score),
+                "all_results": result_df.to_dict()
+            }
+            if hasattr(best_model, "classes_"):
+                data[output_name + "_meta"]["classes"] = list(getattr(best_model, "classes_"))
+        except Exception as e:
+            kernel._send_message("stderr", f"Error storing best model: {e}")
+            return
+
+        # Display results
+        self._send_html(kernel, result_df, title=f"Model Selection Results (metric={metric})")
+        kernel._send_message("stdout", f"Best model '{best_model_name}' (mean {metric}={best_score:.4f}) saved to data['{output_name}'].")
 
         return
