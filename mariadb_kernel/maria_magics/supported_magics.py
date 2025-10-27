@@ -24,6 +24,7 @@ from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.standardize impo
 from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.splitdata import SplitData
 from mariadb_kernel.maria_magics.ml_commands.model_training.train_model import TrainModel
 from mariadb_kernel.maria_magics.ml_commands.model_training.evaluate_model import EvaluateModel
+from mariadb_kernel.maria_magics.ml_commands.model_training.savemodel import SaveModel
 
 def get():
     return {
@@ -47,4 +48,5 @@ def get():
         "splitdata": SplitData,
         "train_model": TrainModel,
         "evaluate_model": EvaluateModel,
+        "savemodel": SaveModel,
     }

@@ -16,14 +16,20 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import LabelEncoder
 
+import matplotlib
+# Use non-interactive backend if needed (safe in most notebook envs)
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import io
+import base64
+
 class EvaluateModel(MariaMagic):
     """
     %evaluate_model [model_name=last_model] [test_name=last_select_test] [pred_name=last_preds]
                     [problem=classification|regression]
 
-    Evaluate a previously trained model stored in `data[model_name]` using the test
-    DataFrame `data[test_name]`. Outputs metrics, confusion matrix, ROC AUC (if applicable),
-    and displays a table with actual vs predicted (and probabilities if available).
+    Nice, visual evaluation of a trained model: metrics card, confusion-matrix plot,
+    classification report and a preview table of actual vs predicted.
     """
     def __init__(self, args=""):
         self.args = args
@@ -37,8 +43,8 @@ class EvaluateModel(MariaMagic):
     def help(self):
         return "Evaluate a trained model on a test DataFrame and show metrics + predictions."
 
+    # reuse helpers from previous version
     def _str_to_obj(self, s):
-        # same helper as in TrainModel
         try:
             return int(s)
         except Exception:
@@ -77,6 +83,45 @@ class EvaluateModel(MariaMagic):
         except Exception:
             pass
 
+    def _send_raw_html(self, kernel, html):
+        """Send raw HTML to the frontend."""
+        try:
+            kernel.send_response(kernel.iopub_socket, "display_data",
+                                 {"data": {"text/html": html}, "metadata": {}})
+        except Exception:
+            pass
+
+    def _plot_confusion_matrix_to_datauri(self, cm, labels):
+        """Draw confusion matrix (matplotlib) and return data URI PNG."""
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(cm, interpolation='nearest')
+        ax.set_title("Confusion matrix")
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+
+        # Set tick labels
+        ax.set_xticks(np.arange(len(labels)))
+        ax.set_yticks(np.arange(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.set_yticklabels(labels)
+
+        # Annotate cells
+        thresh = cm.max() / 2.0 if cm.size else 0
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(j, i, format(int(cm[i, j]), 'd'),
+                        ha="center", va="center",
+                        fontsize=10)
+
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        data = base64.b64encode(buf.read()).decode("ascii")
+        return f"data:image/png;base64,{data}"
+
     def execute(self, kernel, data):
         try:
             args = self.parse_args(self.args)
@@ -101,19 +146,19 @@ class EvaluateModel(MariaMagic):
             kernel._send_message("stderr", f"No test DataFrame found in data['{test_name}'] or it is empty.")
             return
 
-        # try to infer problem from model type if not provided
+        # infer problem if not provided
         if problem_override:
             problem = problem_override.lower()
         else:
             is_classifier = any(attr in dir(model) for attr in ("predict_proba", "decision_function", "classes_"))
             problem = "classification" if is_classifier else "regression"
 
-        # get meta (features + target) from training metadata
+        # get meta
         meta = data.get(model_store_name + "_meta", {}) or {}
         features = meta.get("features")
         target_col = meta.get("target") or meta.get("target_col")
 
-        # fallback: if no target in meta, try to infer target as the only non-feature column
+        # fallback target inference
         if not target_col:
             if features:
                 possible_targets = [c for c in test_df.columns if c not in features]
@@ -124,22 +169,19 @@ class EvaluateModel(MariaMagic):
             kernel._send_message("stderr", "Target column not found in model meta and could not be inferred from test DataFrame. "
                                          "Set data[model_name + '_meta']['target']='<target_column>' when training, or pass target info in meta.")
             return
-
         if target_col not in test_df.columns:
             kernel._send_message("stderr", f"Target column '{target_col}' not present in test DataFrame '{test_name}'.")
             return
-
         if not features:
             kernel._send_message("stderr", "Model metadata does not contain 'features' list. Cannot build X_test.")
             return
-
         missing_features = [c for c in features if c not in test_df.columns]
         if missing_features:
             kernel._send_message("stderr", f"Test DataFrame missing feature columns: {', '.join(missing_features)}")
             return
 
         X_test = test_df[features].copy()
-        y_true_orig = test_df[target_col].copy()  # preserve original values for display
+        y_true_orig = test_df[target_col].copy()
 
         # Predict
         try:
@@ -148,7 +190,7 @@ class EvaluateModel(MariaMagic):
             kernel._send_message("stderr", f"Error during prediction: {e}")
             return
 
-        # Try predict_proba
+        # predict_proba if available
         pred_proba = None
         if problem == "classification" and hasattr(model, "predict_proba"):
             try:
@@ -160,36 +202,30 @@ class EvaluateModel(MariaMagic):
             except Exception:
                 pred_proba = None
 
-        # Try to build preds_display (human-readable)
+        # human-readable preds
         preds_display = preds_raw
         model_classes = getattr(model, "classes_", None)
         try:
-            # if model has classes_ and preds_raw are indices, map to class labels
             if model_classes is not None and pd.api.types.is_integer_dtype(np.asarray(preds_raw).dtype):
                 preds_display = np.asarray(model_classes)[np.asarray(preds_raw).astype(int)]
-            # if preds_raw are numeric but classes_ are strings, try mapping by index
-            elif model_classes is not None and not pd.api.types.is_numeric_dtype(model_classes):
-                # if preds_raw are label indices (ints) handle above; else if preds_raw are strings keep as-is
-                pass
         except Exception:
             preds_display = preds_raw
 
-        # Construct predictions DataFrame
+        # predictions DataFrame
         preds_df = test_df.copy(deep=True)
         preds_df["_predicted"] = preds_display
         if pred_proba is not None:
             preds_df["_pred_proba"] = pred_proba
-
         data[pred_name] = preds_df
 
-        # --- Metrics: ensure consistent types for y_true and preds ---
+        # metrics calculation
         out_lines = []
+        metrics_html = ""
+        cm_image_uri = None
         if problem == "classification":
-            # build arrays for metrics
             y_true_vals = np.asarray(y_true_orig)
             preds_vals = np.asarray(preds_display)
 
-            # If types are mixed (numbers and strings), cast both to str for label-based metrics
             def is_mixed(a, b):
                 return (pd.api.types.is_numeric_dtype(a) and not pd.api.types.is_numeric_dtype(b)) or \
                        (pd.api.types.is_numeric_dtype(b) and not pd.api.types.is_numeric_dtype(a))
@@ -198,7 +234,6 @@ class EvaluateModel(MariaMagic):
                 y_metric = np.asarray(y_true_orig.astype(str))
                 p_metric = np.asarray(pd.Series(preds_display).astype(str))
             else:
-                # prefer numeric if both numeric; else use original dtype (strings)
                 if pd.api.types.is_numeric_dtype(y_true_vals) and pd.api.types.is_numeric_dtype(preds_vals):
                     y_metric = y_true_vals.astype(float)
                     p_metric = preds_vals.astype(float)
@@ -206,7 +241,6 @@ class EvaluateModel(MariaMagic):
                     y_metric = np.asarray(y_true_orig.astype(str))
                     p_metric = np.asarray(pd.Series(preds_display).astype(str))
 
-            # compute basic metrics (these accept string labels fine)
             try:
                 acc = accuracy_score(y_metric, p_metric)
                 prec = precision_score(y_metric, p_metric, average="weighted", zero_division=0)
@@ -217,71 +251,115 @@ class EvaluateModel(MariaMagic):
                 kernel._send_message("stderr", f"Error computing classification metrics: {e}")
                 return
 
-            out_lines.append(f"Classification metrics (model: '{model_store_name}')")
-            out_lines.append(f"  accuracy = {acc:.4f}")
-            out_lines.append(f"  precision (weighted) = {prec:.4f}")
-            out_lines.append(f"  recall (weighted) = {rec:.4f}")
-            out_lines.append(f"  f1 (weighted) = {f1:.4f}")
-            out_lines.append("  Confusion matrix (rows=actual, cols=predicted):")
-            out_lines.append(str(cm.tolist()))
-
-            # ROC AUC: attempt only if predict_proba available and we can map y_true to integer indices
-            roc_text = "  ROC AUC not available."
+            # ROC AUC if possible
+            roc_text = "N/A"
             if pred_proba is not None and model_classes is not None:
                 try:
-                    # map true labels to indices using model.classes_
                     class_to_idx = {str(c): i for i, c in enumerate(model_classes)}
                     y_idx = np.array([class_to_idx.get(str(v), None) for v in y_true_orig])
                     if None in y_idx:
-                        roc_text = "  ROC AUC not computable: some test classes not present in model.classes_."
+                        roc_text = "Not computable: some test classes missing from model.classes_."
                     else:
                         proba_arr = np.asarray(pred_proba)
                         if proba_arr.ndim == 1:
-                            # binary case
                             roc_auc = roc_auc_score(y_idx.astype(int), proba_arr.astype(float))
-                            roc_text = f"  ROC AUC (binary) = {roc_auc:.4f}"
+                            roc_text = f"{roc_auc:.4f}"
                         else:
                             roc_auc = roc_auc_score(y_idx.astype(int), proba_arr, multi_class="ovr", average="weighted")
-                            roc_text = f"  ROC AUC (multiclass OVR, weighted) = {roc_auc:.4f}"
+                            roc_text = f"{roc_auc:.4f}"
                 except Exception:
-                    roc_text = "  ROC AUC computation failed."
-            elif pred_proba is not None and model_classes is None:
-                roc_text = "  ROC AUC not computed: model.classes_ missing."
-            out_lines.append(roc_text)
+                    roc_text = "Computation failed."
 
-            # classification report with readable labels if possible
+            # Prepare metrics HTML card
+            metrics_html = f"""
+            <div style="display:flex; gap:20px; align-items:flex-start; margin-bottom:10px;">
+              <div style="border-radius:8px; padding:12px; box-shadow:0 1px 3px rgba(0,0,0,0.12);">
+                <h4 style="margin:6px 0 8px 0;">Metrics</h4>
+                <table style="border-collapse:collapse;">
+                  <tr><td style="padding:4px 8px;"><strong>Accuracy</strong></td><td style="padding:4px 8px;">{acc:.4f}</td></tr>
+                  <tr><td style="padding:4px 8px;"><strong>Precision (w)</strong></td><td style="padding:4px 8px;">{prec:.4f}</td></tr>
+                  <tr><td style="padding:4px 8px;"><strong>Recall (w)</strong></td><td style="padding:4px 8px;">{rec:.4f}</td></tr>
+                  <tr><td style="padding:4px 8px;"><strong>F1 (w)</strong></td><td style="padding:4px 8px;">{f1:.4f}</td></tr>
+                  <tr><td style="padding:4px 8px;"><strong>ROC AUC</strong></td><td style="padding:4px 8px;">{roc_text}</td></tr>
+                </table>
+              </div>
+            """
+
+            # Render confusion matrix as image and embed
+            # determine label names for axes
             try:
-                target_names = None
                 if model_classes is not None:
-                    target_names = [str(c) for c in model_classes]
-                report = classification_report(y_metric, p_metric, zero_division=0, target_names=target_names)
-                out_lines.append("\nClassification report:\n" + report)
+                    label_names = [str(c) for c in model_classes]
+                else:
+                    # derive from the union of unique labels in y_metric and p_metric
+                    uniq = sorted(set(np.unique(y_metric).tolist() + np.unique(p_metric).tolist()), key=lambda x: str(x))
+                    label_names = [str(x) for x in uniq]
+                cm_arr = np.asarray(cm, dtype=int)
+                cm_image_uri = self._plot_confusion_matrix_to_datauri(cm_arr, label_names)
+                metrics_html += f'<div style="border-radius:8px; padding:12px; box-shadow:0 1px 3px rgba(0,0,0,0.12);"><img src="{cm_image_uri}" alt="confusion matrix" style="max-width:100%; height:auto;"></div>'
             except Exception:
-                pass
+                # fallback: textual representation included below
+                metrics_html += '<div style="padding:8px;">Confusion matrix image failed to render.</div>'
+
+            metrics_html += "</div>"  # close flex container
+
+            # classification report text
+            try:
+                target_names = [str(c) for c in model_classes] if model_classes is not None else None
+                report = classification_report(y_metric, p_metric, zero_division=0, target_names=target_names)
+            except Exception:
+                report = "Classification report not available."
 
         else:
-            # regression metrics
+            # regression branch
             try:
                 preds_num = np.asarray(preds_raw).astype(float)
                 y_true_num = np.asarray(y_true_orig).astype(float)
                 rmse = float(np.sqrt(mean_squared_error(y_true_num, preds_num)))
                 mae = float(mean_absolute_error(y_true_num, preds_num))
                 r2 = float(r2_score(y_true_num, preds_num))
-                out_lines.append(f"Regression metrics (model: '{model_store_name}')")
-                out_lines.append(f"  RMSE = {rmse:.4f}")
-                out_lines.append(f"  MAE  = {mae:.4f}")
-                out_lines.append(f"  R2   = {r2:.4f}")
             except Exception as e:
                 kernel._send_message("stderr", f"Error computing regression metrics: {e}")
                 return
 
-        # send textual summary
-        kernel._send_message("stdout", "\n".join(out_lines))
+            metrics_html = f"""
+            <div style="border-radius:8px; padding:12px; box-shadow:0 1px 3px rgba(0,0,0,0.12);">
+              <h4 style="margin:6px 0 8px 0;">Regression metrics</h4>
+              <table style="border-collapse:collapse;">
+                <tr><td style="padding:4px 8px;"><strong>RMSE</strong></td><td style="padding:4px 8px;">{rmse:.4f}</td></tr>
+                <tr><td style="padding:4px 8px;"><strong>MAE</strong></td><td style="padding:4px 8px;">{mae:.4f}</td></tr>
+                <tr><td style="padding:4px 8px;"><strong>R²</strong></td><td style="padding:4px 8px;">{r2:.4f}</td></tr>
+              </table>
+            </div>
+            """
+            report = None
 
-        # display HTML preview of predictions (actual vs predicted)
+        # Build final HTML to display (metrics + classification report text)
+        html_parts = [
+            f"<div style='font-family:Arial, sans-serif; margin:6px 0 12px 0;'>",
+            metrics_html
+        ]
+        if problem == "classification":
+            html_parts.append("<div style='margin-top:12px;'><h4>Classification report</h4>")
+            html_parts.append(f"<pre style='white-space:pre-wrap; background:#f7f7f7; padding:8px; border-radius:6px;'>{report}</pre></div>")
+            # also add textual confusion matrix below if image not present
+            if cm_image_uri is None:
+                html_parts.append("<div style='margin-top:8px;'><h4>Confusion matrix</h4><pre>")
+                html_parts.append(str(cm.tolist()))
+                html_parts.append("</pre></div>")
+        html_parts.append("</div>")
+
+        # send HTML
         try:
-            self._send_html(kernel, preds_df.head(200),
-                            title=f"Predictions (actual={target_col} | predicted=_predicted). Showing up to 200 rows.")
+            self._send_raw_html(kernel, "\n".join(html_parts))
+        except Exception:
+            pass
+
+        # then show predictions table (actual vs predicted) using your helper
+        try:
+            # show a limited set (up to 200 rows)
+            display_df = preds_df[[target_col, "_predicted"] + (["_pred_proba"] if "_pred_proba" in preds_df.columns else [])]
+            self._send_html(kernel, display_df.head(200), title="Predictions preview (actual vs predicted)")
         except Exception:
             pass
 
