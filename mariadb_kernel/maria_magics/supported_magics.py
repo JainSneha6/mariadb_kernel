@@ -25,6 +25,7 @@ from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.splitdata import
 from mariadb_kernel.maria_magics.ml_commands.model_training.train_model import TrainModel
 from mariadb_kernel.maria_magics.ml_commands.model_training.evaluate_model import EvaluateModel
 from mariadb_kernel.maria_magics.ml_commands.model_training.savemodel import SaveModel
+from mariadb_kernel.maria_magics.ml_commands.ml_pipeline.select_features import SelectFeatures
 
 def get():
     return {
@@ -49,4 +50,5 @@ def get():
         "train_model": TrainModel,
         "evaluate_model": EvaluateModel,
         "savemodel": SaveModel,
+        "select_features": SelectFeatures
     }
