@@ -19,6 +19,11 @@ from mariadb_kernel.maria_magics.ml_commands.data_cleaning.outliers import Outli
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.dropoutliers import DropOutliers
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.clipoutliers import ClipOutliers
 from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.encode import Encode
+from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.normalize import Normalize
+from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.standardize import Standardize
+from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.splitdata import SplitData
+from mariadb_kernel.maria_magics.ml_commands.model_training.train_model import TrainModel
+from mariadb_kernel.maria_magics.ml_commands.model_training.evaluate_model import EvaluateModel
 
 def get():
     return {
@@ -37,4 +42,9 @@ def get():
         "dropoutliers": DropOutliers,
         "clipoutliers": ClipOutliers,
         "encode": Encode,
+        "normalize": Normalize,
+        "standardize": Standardize,
+        "splitdata": SplitData,
+        "train_model": TrainModel,
+        "evaluate_model": EvaluateModel,
     }
