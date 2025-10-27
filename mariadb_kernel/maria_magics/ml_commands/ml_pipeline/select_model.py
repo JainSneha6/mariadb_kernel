@@ -11,8 +11,9 @@ from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge, La
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingClassifier, GradientBoostingRegressor, AdaBoostClassifier, AdaBoostRegressor
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-from sklearn.neural_network import MLPClassifier
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 
+# Optional external libraries
 _XGBOOST_AVAILABLE = False
 _LIGHTGBM_AVAILABLE = False
 _CATBOOST_AVAILABLE = False
@@ -36,15 +37,15 @@ except Exception:
 
 class SelectModel(MariaMagic):
     """
-    %select_model features=col1,col2 target=target_col
-                  [models=rf,logistic,svm] [cv=5] [metric=accuracy|r2|f1|precision|recall|mse|mae]
+    %select_model target=target_col
+                  [features=col1,col2] [cv=5] [primary_metric=accuracy|r2|f1|precision|recall|mse|mae]
                   [problem=classification|regression] [output_name=best_model]
                   [inplace=True|False] [model_params={'rf': {'n_estimators': 100}, 'logistic': {'C': 1.0}}]
 
-    Select the best model by comparing multiple models on data['last_select'] using cross-validation.
-    Models: logistic, rf, svm, knn, gbm, ada, mlp, xgboost, lightgbm, catboost (classification);
-            linear, ridge, lasso, rf, knn, gbm, ada, mlp, xgboost, lightgbm, catboost (regression).
-    Stores the best model in data[output_name] and displays a table of model performances.
+    Select the best model by comparing all available models on data['last_select'] using cross-validation.
+    If features are not provided, uses data['selected_features'] from %select_features.
+    Tests all metrics (classification: accuracy, f1, precision, recall; regression: r2, mse, mae).
+    Stores the best model in data[output_name] based on primary_metric and displays a table of performances.
     """
     def __init__(self, args=""):
         self.args = args
@@ -99,7 +100,6 @@ class SelectModel(MariaMagic):
             pass
 
     def _choose_model(self, name, problem, params=None):
-        # Reuse TrainModel's model selection logic
         p = params or {}
         name = name.lower()
         if name in ("logistic", "logistic_regression", "lr"):
@@ -163,45 +163,38 @@ class SelectModel(MariaMagic):
 
         features_arg = args.get("features")
         target = args.get("target")
-        models_arg = args.get("models", "rf,logistic,knn")  # Default models
         cv = int(args.get("cv", 5) or 5)
-        metric = args.get("metric", None)
+        primary_metric = args.get("primary_metric", None)
         problem_override = args.get("problem", None)
         output_name = args.get("output_name", "best_model")
         inplace = bool(args.get("inplace", True))
         model_params = args.get("model_params", {}) or {}
 
-        if not features_arg:
-            kernel._send_message("stderr", "features argument is required (features=col1,col2...).")
-            return
         if not target:
             kernel._send_message("stderr", "target argument is required (target=target_col).")
             return
 
-        # Parse features
-        if isinstance(features_arg, str):
-            features = [c.strip() for c in features_arg.split(",") if c.strip()]
-        elif isinstance(features_arg, (list, tuple)):
-            features = list(features_arg)
+        # Use selected_features if features not provided
+        if not features_arg:
+            features = data.get("selected_features")
+            if not features:
+                kernel._send_message("stderr", "No features provided and no selected_features found. Run %select_features first.")
+                return
         else:
-            kernel._send_message("stderr", "features must be comma-separated string or list.")
-            return
-
-        # Parse models
-        if isinstance(models_arg, str):
-            models = [m.strip() for m in models_arg.split(",") if m.strip()]
-        elif isinstance(models_arg, (list, tuple)):
-            models = list(models_arg)
-        else:
-            kernel._send_message("stderr", "models must be comma-separated string or list.")
-            return
+            if isinstance(features_arg, str):
+                features = [c.strip() for c in features_arg.split(",") if c.strip()]
+            elif isinstance(features_arg, (list, tuple)):
+                features = list(features_arg)
+            else:
+                kernel._send_message("stderr", "features must be comma-separated string or list.")
+                return
 
         missing = [c for c in features + [target] if c not in df.columns]
         if missing:
             kernel._send_message("stderr", f"Missing columns in DataFrame: {', '.join(missing)}")
             return
 
-        # Determine problem type (same logic as TrainModel)
+        # Determine problem type
         if problem_override:
             problem = problem_override.lower()
             if problem not in ("classification", "regression"):
@@ -220,31 +213,45 @@ class SelectModel(MariaMagic):
             else:
                 problem = "classification"
 
-        # Validate metric
-        valid_metrics = {
+        # Define all available models based on problem type
+        classification_models = ["logistic", "rf", "svm", "knn", "gbm", "ada", "mlp"]
+        regression_models = ["linear", "ridge", "lasso", "rf", "knn", "gbm", "ada", "mlp"]
+        if _XGBOOST_AVAILABLE:
+            classification_models.append("xgboost")
+            regression_models.append("xgboost")
+        if _LIGHTGBM_AVAILABLE:
+            classification_models.append("lightgbm")
+            regression_models.append("lightgbm")
+        if _CATBOOST_AVAILABLE:
+            classification_models.append("catboost")
+            regression_models.append("catboost")
+        models = classification_models if problem == "classification" else regression_models
+
+        # Define all metrics
+        metrics = {
             "classification": ["accuracy", "f1", "precision", "recall"],
             "regression": ["r2", "mse", "mae"]
         }
-        if metric is None:
-            metric = "accuracy" if problem == "classification" else "r2"
-        if metric not in valid_metrics[problem]:
-            kernel._send_message("stderr", f"Invalid metric '{metric}' for {problem}. Choose from {', '.join(valid_metrics[problem])}.")
+        if primary_metric is None:
+            primary_metric = "accuracy" if problem == "classification" else "r2"
+        if primary_metric not in metrics[problem]:
+            kernel._send_message("stderr", f"Invalid primary_metric '{primary_metric}' for {problem}. Choose from {', '.join(metrics[problem])}.")
             return
 
         # Prepare data
         X = df[features].copy()
         y = df[target].copy()
 
-        # Handle missing values (simple imputation)
+        # Handle missing values
         X = X.fillna(X.mean(numeric_only=True)) if problem == "regression" else X.fillna(X.mode().iloc[0])
         if X.isna().any().any():
             kernel._send_message("stderr", "Features contain non-numeric data or unhandled missing values.")
             return
 
-        # Evaluate models
+        # Evaluate models across all metrics
         results = []
         best_model = None
-        best_score = -float("inf") if metric not in ("mse", "mae") else float("inf")
+        best_score = -float("inf") if primary_metric not in ("mse", "mae") else float("inf")
         best_model_name = None
 
         for model_name in models:
@@ -252,32 +259,33 @@ class SelectModel(MariaMagic):
                 # Get model-specific parameters
                 params = model_params.get(model_name, {}) if isinstance(model_params, dict) else {}
                 model = self._choose_model(model_name, problem, params)
-                scoring = metric if metric in ("accuracy", "f1", "precision", "recall", "r2") else (
-                    "neg_mean_squared_error" if metric == "mse" else "neg_mean_absolute_error"
-                )
-                cv_scores = cross_val_score(model, X, y, cv=cv, scoring=scoring)
-                mean_score = np.mean(cv_scores)
-                std_score = np.std(cv_scores)
+                model_result = {"Model": model_name}
 
-                # Adjust score for negative metrics (mse, mae)
-                if metric in ("mse", "mae"):
-                    mean_score = -mean_score  # Convert back to positive for reporting
+                # Evaluate all metrics
+                for metric in metrics[problem]:
+                    scoring = metric if metric in ("accuracy", "f1", "precision", "recall", "r2") else (
+                        "neg_mean_squared_error" if metric == "mse" else "neg_mean_absolute_error"
+                    )
+                    cv_scores = cross_val_score(model, X, y, cv=cv, scoring=scoring)
+                    mean_score = np.mean(cv_scores)
+                    std_score = np.std(cv_scores)
+                    if metric in ("mse", "mae"):
+                        mean_score = -mean_score  # Convert to positive
+                    model_result[f"{metric}_Mean"] = mean_score
+                    model_result[f"{metric}_Std"] = std_score
 
-                results.append({
-                    "Model": model_name,
-                    "Mean_Score": mean_score,
-                    "Std_Score": std_score
-                })
+                results.append(model_result)
 
-                # Update best model (maximize for accuracy, f1, precision, recall, r2; minimize for mse, mae)
-                if metric in ("mse", "mae"):
-                    if mean_score < best_score:
-                        best_score = mean_score
+                # Update best model based on primary_metric
+                current_score = model_result[f"{primary_metric}_Mean"]
+                if primary_metric in ("mse", "mae"):
+                    if current_score < best_score:
+                        best_score = current_score
                         best_model = model
                         best_model_name = model_name
                 else:
-                    if mean_score > best_score:
-                        best_score = mean_score
+                    if current_score > best_score:
+                        best_score = current_score
                         best_model = model
                         best_model_name = model_name
 
@@ -290,9 +298,11 @@ class SelectModel(MariaMagic):
             return
 
         # Create results DataFrame
-        result_df = pd.DataFrame(results).sort_values("Mean_Score", ascending=metric in ("mse", "mae"))
-        result_df["Mean_Score"] = result_df["Mean_Score"].round(4)
-        result_df["Std_Score"] = result_df["Std_Score"].round(4)
+        result_df = pd.DataFrame(results)
+        for metric in metrics[problem]:
+            result_df[f"{metric}_Mean"] = result_df[f"{metric}_Mean"].round(4)
+            result_df[f"{metric}_Std"] = result_df[f"{metric}_Std"].round(4)
+        result_df = result_df.sort_values(f"{primary_metric}_Mean", ascending=primary_metric in ("mse", "mae"))
 
         # Fit the best model on the full training data
         try:
@@ -309,7 +319,7 @@ class SelectModel(MariaMagic):
                 "problem": problem,
                 "features": features,
                 "target": target,
-                "metric": metric,
+                "primary_metric": primary_metric,
                 "cv": cv,
                 "score": float(best_score),
                 "all_results": result_df.to_dict()
@@ -321,7 +331,7 @@ class SelectModel(MariaMagic):
             return
 
         # Display results
-        self._send_html(kernel, result_df, title=f"Model Selection Results (metric={metric})")
-        kernel._send_message("stdout", f"Best model '{best_model_name}' (mean {metric}={best_score:.4f}) saved to data['{output_name}'].")
+        self._send_html(kernel, result_df, title=f"Model Selection Results (primary_metric={primary_metric})")
+        kernel._send_message("stdout", f"Best model '{best_model_name}' (mean {primary_metric}={best_score:.4f}) saved to data['{output_name}'].")
 
         return

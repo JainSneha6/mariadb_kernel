@@ -1,3 +1,4 @@
+# encode.py
 # Copyright (c) MariaDB Foundation.
 # Distributed under the terms of the Modified BSD License.
 
@@ -126,23 +127,35 @@ class Encode(MariaMagic):
         result_df = df if inplace else df.copy()
 
         try:
+            # We'll store encoder info here to save into data at the end
+            encoder_obj = None
+            label_mappings = None
+
             if method == "label":
                 # Use pandas.factorize which handles NaN by assigning -1 codes
+                label_mappings = {}
                 for col in columns:
                     codes, uniques = pd.factorize(result_df[col], sort=True)
                     new_col = f"{col}_lbl"
                     result_df[new_col] = codes
+                    # Save mapping value->code for reuse later
+                    mapping = {val: idx for idx, val in enumerate(uniques)}
+                    label_mappings[col] = mapping
                     if drop_original:
                         result_df.drop(columns=[col], inplace=True)
+
+                encoder_obj = label_mappings
 
             elif method == "onehot":
                 # sklearn OneHotEncoder with version compatibility
                 encoder = self._make_ohe(handle_unknown="ignore")
                 # replace NaN with sentinel string so it's treated as a category
-                arr = encoder.fit_transform(result_df[columns].astype(object).fillna("___MISSING___"))
+                tmp = result_df[columns].astype(object).fillna("___MISSING___")
+                arr = encoder.fit_transform(tmp)
                 # feature names (sklearn >= 1.0)
                 try:
                     feature_names = encoder.get_feature_names_out(columns)
+                    feature_names = [str(fn) for fn in feature_names]
                 except Exception:
                     # fallback: build names manually
                     cats = encoder.categories_
@@ -150,11 +163,15 @@ class Encode(MariaMagic):
                     for cname, cat_list in zip(columns, cats):
                         for cat in cat_list:
                             feature_names.append(f"{cname}_{str(cat)}")
+                # create DataFrame of encoded features
                 ohe_df = pd.DataFrame(arr, columns=feature_names, index=result_df.index)
+                # concatenate appropriately
                 if drop_original:
                     result_df = pd.concat([result_df.drop(columns=columns), ohe_df], axis=1)
                 else:
                     result_df = pd.concat([result_df, ohe_df], axis=1)
+
+                encoder_obj = encoder  # save fitted OneHotEncoder
 
             elif method == "ordinal":
                 # use sklearn OrdinalEncoder for one or multiple columns (automatic ordering)
@@ -167,16 +184,28 @@ class Encode(MariaMagic):
                     if drop_original:
                         result_df.drop(columns=[col], inplace=True)
 
+                encoder_obj = enc
+
             else:
                 kernel._send_message("stderr", "Unsupported method. Supported: label, onehot, ordinal.")
                 return
 
-            # Apply result
+            # Apply result back to shared data if inplace
             if inplace:
                 data["last_select"] = result_df
                 kernel._send_message("stdout", "Encoded columns in-place and updated last_select.")
             else:
                 kernel._send_message("stdout", "Displayed encoded result (last_select not modified).")
+
+            # Save encoder (or mapping) to shared data for downstream pipeline usage
+            try:
+                if encoder_obj is not None:
+                    data["last_select_encoder"] = encoder_obj
+                elif label_mappings is not None:
+                    data["last_select_encoder"] = label_mappings
+            except Exception:
+                # don't fail pipeline just because we couldn't save encoder
+                pass
 
             # display
             self._send_html(kernel, result_df)

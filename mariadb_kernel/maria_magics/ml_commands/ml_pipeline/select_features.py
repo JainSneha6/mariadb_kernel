@@ -13,12 +13,13 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 class SelectFeatures(MariaMagic):
     """
-    %select_features features=col1,col2 target=target_col
+    %select_features target=target_col
                      [method=correlation|rf_importance|rfe|mutual_info|chi2|anova|l1_selection|variance]
                      [k=5] [problem=classification|regression]
                      [output_name=selected_features] [inplace=True|False]
 
     Identify the best features for training a model on data['last_select'].
+    Uses all columns except the target column as features.
     Methods:
     - correlation: Absolute Pearson correlation with the target.
     - rf_importance: RandomForest feature importance scores.
@@ -95,7 +96,6 @@ class SelectFeatures(MariaMagic):
             kernel._send_message("stderr", "Error parsing arguments. Use key=value syntax.")
             return
 
-        features_arg = args.get("features")
         target = args.get("target")
         method = args.get("method", "correlation").lower()
         k = args.get("k", 5)
@@ -103,28 +103,21 @@ class SelectFeatures(MariaMagic):
         output_name = args.get("output_name", "selected_features")
         inplace = bool(args.get("inplace", True))
 
-        if not features_arg:
-            kernel._send_message("stderr", "features argument is required (features=col1,col2...).")
-            return
         if not target:
             kernel._send_message("stderr", "target argument is required (target=target_col).")
             return
 
-        # Parse features
-        if isinstance(features_arg, str):
-            features = [c.strip() for c in features_arg.split(",") if c.strip()]
-        elif isinstance(features_arg, (list, tuple)):
-            features = list(features_arg)
-        else:
-            kernel._send_message("stderr", "features must be comma-separated string or list.")
+        if target not in df.columns:
+            kernel._send_message("stderr", f"Target column '{target}' not found in DataFrame.")
             return
 
-        missing = [c for c in features + [target] if c not in df.columns]
-        if missing:
-            kernel._send_message("stderr", f"Missing columns in DataFrame: {', '.join(missing)}")
+        # Use all columns except the target as features
+        features = [col for col in df.columns if col != target]
+        if not features:
+            kernel._send_message("stderr", "No features available after excluding target column.")
             return
 
-        # Determine problem type (same logic as TrainModel)
+        # Determine problem type
         if problem_override:
             problem = problem_override.lower()
             if problem not in ("classification", "regression"):
@@ -153,7 +146,7 @@ class SelectFeatures(MariaMagic):
             kernel._send_message("stderr", "Features contain non-numeric data or unhandled missing values.")
             return
 
-        # Scale data for methods that require it (e.g., chi2 requires non-negative, l1_selection benefits from scaling)
+        # Scale data for methods that require it
         if method in ("chi2", "l1_selection"):
             scaler = MinMaxScaler() if method == "chi2" else StandardScaler()
             try:
@@ -165,7 +158,6 @@ class SelectFeatures(MariaMagic):
         # Feature selection
         try:
             if method == "correlation":
-                # Pearson correlation (absolute value) with target
                 correlations = X.corrwith(y, method="pearson").abs()
                 scores = correlations.sort_values(ascending=False)
                 selected_features = scores.head(k).index.tolist()
@@ -175,7 +167,6 @@ class SelectFeatures(MariaMagic):
                 })
 
             elif method == "rf_importance":
-                # RandomForest feature importance
                 model = RandomForestClassifier() if problem == "classification" else RandomForestRegressor()
                 model.fit(X, y)
                 importances = pd.Series(model.feature_importances_, index=features)
@@ -187,12 +178,11 @@ class SelectFeatures(MariaMagic):
                 })
 
             elif method == "rfe":
-                # Recursive Feature Elimination
                 estimator = RandomForestClassifier() if problem == "classification" else RandomForestRegressor()
                 selector = RFE(estimator, n_features_to_select=k)
                 selector.fit(X, y)
                 ranking = pd.Series(selector.ranking_, index=features)
-                scores = 1 / (ranking + 1)  # Inverse ranking as score (higher is better)
+                scores = 1 / (ranking + 1)
                 selected_features = ranking[ranking == 1].index.tolist()
                 result_df = pd.DataFrame({
                     "Feature": ranking.index,
@@ -201,7 +191,6 @@ class SelectFeatures(MariaMagic):
                 }).sort_values("Score", ascending=False)
 
             elif method == "mutual_info":
-                # Mutual Information
                 score_func = mutual_info_classif if problem == "classification" else mutual_info_regression
                 selector = SelectKBest(score_func=score_func, k=k)
                 selector.fit(X, y)
@@ -214,7 +203,6 @@ class SelectFeatures(MariaMagic):
                 })
 
             elif method == "chi2":
-                # Chi-squared (classification only, requires non-negative features)
                 if problem != "classification":
                     kernel._send_message("stderr", "chi2 method is only for classification problems.")
                     return
@@ -232,7 +220,6 @@ class SelectFeatures(MariaMagic):
                 })
 
             elif method == "anova":
-                # ANOVA F-test
                 score_func = f_classif if problem == "classification" else f_regression
                 selector = SelectKBest(score_func=score_func, k=k)
                 selector.fit(X, y)
@@ -245,10 +232,8 @@ class SelectFeatures(MariaMagic):
                 })
 
             elif method == "l1_selection":
-                # L1-based feature selection
                 model = LogisticRegression(penalty="l1", solver="liblinear", max_iter=1000) if problem == "classification" else Lasso(alpha=0.01)
                 model.fit(X, y)
-                # Use absolute coefficients as importance scores
                 scores = pd.Series(np.abs(model.coef_.ravel() if problem == "classification" else model.coef_), index=features)
                 scores = scores.sort_values(ascending=False)
                 selected_features = scores[scores > 0].head(k).index.tolist()
@@ -258,8 +243,7 @@ class SelectFeatures(MariaMagic):
                 })
 
             elif method == "variance":
-                # Variance Threshold
-                selector = VarianceThreshold(threshold=0.0)  # Default threshold, can be customized via args if needed
+                selector = VarianceThreshold(threshold=0.0)
                 selector.fit(X)
                 variances = pd.Series(selector.variances_, index=features)
                 scores = variances.sort_values(ascending=False)

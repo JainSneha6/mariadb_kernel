@@ -29,6 +29,7 @@ from mariadb_kernel.maria_magics.ml_commands.ml_pipeline.select_features import 
 from mariadb_kernel.maria_magics.ml_commands.ml_pipeline.select_model import SelectModel
 from mariadb_kernel.maria_magics.ml_commands.model_training.loadmodel import LoadModel
 from mariadb_kernel.maria_magics.ml_commands.model_training.predict import Predict
+from mariadb_kernel.maria_magics.ml_commands.ml_pipeline.ml_pipeline import MLPipeline
 
 def get():
     return {
@@ -57,4 +58,5 @@ def get():
         "predict": Predict,
         "select_features": SelectFeatures,
         "select_model": SelectModel,
+        "ml_pipeline": MLPipeline,
     }
