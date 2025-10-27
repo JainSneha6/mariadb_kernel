@@ -1,7 +1,6 @@
 import joblib
 import shlex
 import json
-import time
 from distutils import util
 import logging
 from mariadb_kernel.maria_magics.maria_magic import MariaMagic
@@ -29,11 +28,11 @@ def _str_to_obj(s):
     return s
 
 
-class SaveModel(MariaMagic):
+class LoadModel(MariaMagic):
     """
-    %save_model model_name_in_data=last_model save_path=/tmp/model.joblib [overwrite=True|False]
+    %load_model load_path=/tmp/model.joblib [target_key=last_model]
 
-    Saves a trained model (from the `data` dict) to a local file using joblib.
+    Loads a locally saved .joblib model into the `data` dictionary.
     """
 
     def __init__(self, args=""):
@@ -44,10 +43,10 @@ class SaveModel(MariaMagic):
         return "Line"
 
     def name(self):
-        return "save_model"
+        return "load_model"
 
     def help(self):
-        return "Save a trained model to a local .joblib file."
+        return "Load a saved model from a local .joblib file."
 
     def parse_args(self, input_str):
         if not input_str or input_str.strip() == "":
@@ -64,27 +63,16 @@ class SaveModel(MariaMagic):
             kernel._send_message("stderr", "Error parsing arguments.")
             return
 
-        model_key = args.get("model_name_in_data", "last_model")
-        save_path = args.get("save_path")
-        overwrite = bool(args.get("overwrite", False))
+        load_path = args.get("load_path")
+        target_key = args.get("target_key", "last_model")
 
-        if not save_path:
-            kernel._send_message("stderr", "You must provide save_path=/path/to/file.joblib")
-            return
-
-        model_obj = data.get(model_key)
-        if model_obj is None:
-            kernel._send_message("stderr", f"No model found in data['{model_key}'].")
-            return
-
-        # If file exists and overwrite=False
-        import os
-        if os.path.exists(save_path) and not overwrite:
-            kernel._send_message("stderr", f"File {save_path} already exists. Use overwrite=True to replace it.")
+        if not load_path:
+            kernel._send_message("stderr", "You must provide load_path=/path/to/file.joblib")
             return
 
         try:
-            joblib.dump(model_obj, save_path)
-            kernel._send_message("stdout", f"Model from data['{model_key}'] saved to {save_path}")
+            model_obj = joblib.load(load_path)
+            data[target_key] = model_obj
+            kernel._send_message("stdout", f"Loaded model from {load_path} → data['{target_key}']")
         except Exception as e:
-            kernel._send_message("stderr", f"Failed to save model: {e}")
+            kernel._send_message("stderr", f"Failed to load model: {e}")

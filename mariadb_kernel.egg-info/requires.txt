@@ -1,0 +1,9 @@
+pandas
+json2html
+matplotlib
+lxml
+setuptools
+setuptools-scm
+ipykernel
+beautifulsoup4
+mycli
