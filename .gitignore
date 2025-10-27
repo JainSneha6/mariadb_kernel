@@ -17,7 +17,3 @@ mariadb_kernel/_version.py
 .vscode/
 
 .eggs/
-catboost_info/
-mariadb_kernel.egg-info/
-models
-
