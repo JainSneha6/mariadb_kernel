@@ -12,7 +12,7 @@ class Normalize(MariaMagic):
     """
     %normalize [columns=col1,col2,...] [feature_range=0,1] [inplace=True|False]
 
-    Scales numeric columns to a fixed range (default 0–1) using sklearn's MinMaxScaler.
+    Scales numeric columns to a fixed range (default 0-1) using sklearn's MinMaxScaler.
 
     - columns: list of columns to normalize. If omitted, all numeric columns are used.
     - feature_range: lower and upper bounds for scaling (default: 0,1)

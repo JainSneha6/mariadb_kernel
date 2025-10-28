@@ -399,7 +399,7 @@ class ClipOutliers(MariaMagic):
         # Attempt to insert metadata (best-effort)
         try:
             args_for_db = self.args if isinstance(self.args, str) else str(self.args)
-            affected_columns_str = ", ".join(target_columns)
+            affected_columns_str = "\n".join(target_columns)
             message_str = "\n".join(messages)
             self._insert_metadata(
                 kernel=kernel,
