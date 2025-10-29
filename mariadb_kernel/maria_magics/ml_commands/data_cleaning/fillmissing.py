@@ -303,7 +303,7 @@ class FillMissing(MariaMagic):
                         kernel=kernel,
                         command_name=self.name(),
                         arguments=self.args if isinstance(self.args, str) else str(self.args),
-                        affected_columns=",".join(target_columns),
+                        affected_columns="\n".join(target_columns),
                         operation_status="error",
                         message=f"Column(s) not found: {', '.join(missing_cols)}",
                         db_name=db_name,
@@ -404,7 +404,7 @@ class FillMissing(MariaMagic):
         # Insert metadata (best-effort)
         try:
             args_for_db = self.args if isinstance(self.args, str) else str(self.args)
-            affected_columns_str = ", ".join(target_columns) if target_columns else ""
+            affected_columns_str = "\n".join(target_columns) if target_columns else ""
             message_str = "\n".join(messages)
             self._insert_metadata(
                 kernel=kernel,

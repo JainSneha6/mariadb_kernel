@@ -339,7 +339,7 @@ class DropMissing(MariaMagic):
         # Insert metadata (best-effort)
         try:
             args_for_db = self.args if isinstance(self.args, str) else str(self.args)
-            affected_columns_str = ", ".join(columns) if columns else "ALL_COLUMNS"
+            affected_columns_str = "\n".join(columns) if columns else "ALL_COLUMNS"
             message_str = "\n".join(messages)
             self._insert_metadata(
                 kernel=kernel,

@@ -329,7 +329,7 @@ class Missing(MariaMagic):
                     kernel=kernel,
                     command_name=self.name(),
                     arguments=self.args if isinstance(self.args, str) else str(self.args),
-                    affected_columns=",".join(columns) if columns else "",
+                    affected_columns="\n".join(columns) if columns else "",
                     operation_status="error",
                     message=msg,
                     db_name=db_name,
@@ -359,7 +359,7 @@ class Missing(MariaMagic):
             self._send_html(kernel, out)
 
             # Prepare metadata success info
-            affected_columns_str = ", ".join(columns) if columns else "ALL_COLUMNS"
+            affected_columns_str = "\n".join(columns) if columns else "ALL_COLUMNS"
             message = f"%missing action={action} examined {len(out)} column(s); total_rows={total}."
             operation_status = "success"
 
@@ -386,7 +386,7 @@ class Missing(MariaMagic):
                     kernel=kernel,
                     command_name=self.name(),
                     arguments=self.args if isinstance(self.args, str) else str(self.args),
-                    affected_columns=", ".join(columns) if columns else "ALL_COLUMNS",
+                    affected_columns="\n".join(columns) if columns else "ALL_COLUMNS",
                     operation_status="error",
                     message=msg,
                     db_name=db_name,

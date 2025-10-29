@@ -403,7 +403,7 @@ class Stats(MariaMagic):
                     kernel=kernel,
                     command_name=self.name(),
                     arguments=self.args if isinstance(self.args, str) else str(self.args),
-                    affected_columns=",".join(columns) if columns else "",
+                    affected_columns="\n".join(columns) if columns else "",
                     operation_status="error",
                     message=msg,
                     db_name=db_name,
@@ -433,7 +433,7 @@ class Stats(MariaMagic):
             self._send_html(kernel, result)
 
             # Insert metadata (success)
-            affected_columns_str = ", ".join(columns) if columns else "ALL_COLUMNS"
+            affected_columns_str = "\n".join(columns) if columns else "ALL_COLUMNS"
             pct_str = ",".join(str(p) for p in (percentiles or [])) if percentiles else ""
             message = f"Stats computed for {len(result.columns) if hasattr(result, 'columns') else 'N'} column(s); total_rows={len(subdf)}; percentiles={pct_str}; include={include}."
             operation_status = "success"
@@ -460,7 +460,7 @@ class Stats(MariaMagic):
                     kernel=kernel,
                     command_name=self.name(),
                     arguments=self.args if isinstance(self.args, str) else str(self.args),
-                    affected_columns=", ".join(columns) if columns else "ALL_COLUMNS",
+                    affected_columns="\n".join(columns) if columns else "ALL_COLUMNS",
                     operation_status="error",
                     message=msg,
                     db_name=db_name,

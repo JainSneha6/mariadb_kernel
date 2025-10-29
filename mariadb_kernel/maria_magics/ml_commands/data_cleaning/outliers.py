@@ -480,7 +480,7 @@ class Outliers(MariaMagic):
                         kernel=kernel,
                         command_name=self.name(),
                         arguments=self.args if isinstance(self.args, str) else str(self.args),
-                        affected_columns=",".join(columns) if columns else "",
+                        affected_columns="\n".join(columns) if columns else "",
                         operation_status="error",
                         message=msg,
                         db_name=db_name,
@@ -564,7 +564,7 @@ class Outliers(MariaMagic):
         # Insert metadata (best-effort)
         try:
             args_for_db = self.args if isinstance(self.args, str) else str(self.args)
-            affected_columns_str = ", ".join(target_columns)
+            affected_columns_str = "\n".join(target_columns)
             message_str = "\n".join(messages)
             self._insert_metadata(
                 kernel=kernel,
