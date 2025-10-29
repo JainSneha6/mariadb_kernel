@@ -6,6 +6,15 @@ import shlex
 from distutils import util
 import pandas as pd
 from sklearn.model_selection import train_test_split
+import logging
+import os
+import re
+
+# optional helper to reliably get current DB name (if available)
+try:
+    from mariadb_kernel.sql_fetch import SqlFetch
+except Exception:
+    SqlFetch = None
 
 
 class SplitData(MariaMagic):
@@ -16,30 +25,9 @@ class SplitData(MariaMagic):
 
     Split the current data["last_select"] DataFrame into train/test/(validation).
 
-    - test_size: float fraction (0-1) or int count. Interpreted relative to the original dataset.
-                 Default: 0.2
-    - val_size:  float fraction (0-1) or int count. Interpreted relative to the original dataset.
-                 If 0 (default), no validation set is created.
-    - stratify:  column name to stratify on (must exist in the DataFrame).
-    - shuffle:   whether to shuffle before splitting (default True).
-    - random_state: integer seed for reproducibility (default None).
-    - inplace:   if True (default), sets data["last_select"] to the training set and also stores
-                 test/val under the provided names. If False, original last_select is kept and train/test/val
-                 are stored under the provided names.
-    - train_name/test_name/val_name: keys under which resulting DataFrames will be stored in `data`.
-                 Defaults: last_select_train, last_select_test, last_select_val
-
-    Behavior notes:
-      - test_size and val_size may be integers (counts) or floats (fractions of the original dataset).
-      - If both fractions are provided, the code first removes the test set (test_size of original),
-        then splits the remaining data to create the validation set. The computed relative fraction
-        for the second split uses val_size relative to the original dataset (so results match user intent).
-      - If val_size is 0 or not provided, only train/test split occurs.
-
-    Examples:
-      %splitdata
-      %splitdata test_size=0.25 val_size=0.1 stratify=target random_state=123
-      %splitdata test_size=100 val_size=50 inplace=False
+    Execution metadata is recorded into table `magic_metadata` with fields:
+      id, command_name, arguments, execution_timestamp, affected_columns,
+      operation_status, message, db_name, user_name
     """
 
     def __init__(self, args=""):
@@ -55,7 +43,7 @@ class SplitData(MariaMagic):
         return (
             "%splitdata [test_size=0.2] [val_size=0.1] [stratify=colname] [shuffle=True|False]\n"
             "[random_state=42] [inplace=True|False] [train_name=name] [test_name=name] [val_name=name]\n"
-            "Split last_select into train/test/(val)."
+            "Split last_select into train/test/(val). Execution metadata recorded in magic_metadata."
         )
 
     def _str_to_obj(self, s):
@@ -91,16 +79,200 @@ class SplitData(MariaMagic):
         except Exception:
             pass
 
+    # --------------- metadata / DB helpers (best-effort) ----------------
+    def _get_mariadb_client(self, kernel):
+        return getattr(kernel, "mariadb_client", None)
+
+    def _get_logger(self, kernel):
+        return getattr(kernel, "log", logging.getLogger(__name__))
+
+    def _sql_escape(self, val):
+        if val is None:
+            return "NULL"
+        if not isinstance(val, str):
+            val = str(val)
+        return "'" + val.replace("'", "''") + "'"
+
+    def _get_db_name(self, kernel):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+
+        # Try SqlFetch if available
+        if SqlFetch is not None and mariadb_client is not None:
+            try:
+                sf = SqlFetch(mariadb_client, log)
+                dbname = sf.get_db_name()
+                if isinstance(dbname, str):
+                    return dbname
+            except Exception:
+                log.debug("SqlFetch available but .get_db_name() failed; falling back.")
+
+        if mariadb_client is None:
+            return ""
+
+        try:
+            result = mariadb_client.run_statement("SELECT DATABASE();")
+            if mariadb_client.iserror() or not result:
+                return ""
+            try:
+                dfs = pd.read_html(result)
+                if dfs and len(dfs) > 0:
+                    val = dfs[0].iloc[0, 0]
+                    if isinstance(val, float) and pd.isna(val):
+                        return ""
+                    return str(val) if val is not None else ""
+            except Exception:
+                m = re.search(r"<td.*?>(.*?)</td>", str(result), flags=re.S | re.I)
+                if m:
+                    txt = re.sub(r"<.*?>", "", m.group(1)).strip()
+                    if txt.lower() == "null" or txt == "":
+                        return ""
+                    return txt
+                txt = str(result).strip()
+                if txt.lower() == "null" or txt == "":
+                    return ""
+                return txt
+        except Exception:
+            return ""
+        return ""
+
+    def _get_user_name(self, kernel):
+        candidates = [
+            getattr(kernel, "user_name", None),
+            getattr(kernel, "username", None),
+            getattr(kernel, "user", None),
+            getattr(kernel, "session", None),
+        ]
+        for cand in candidates:
+            if cand is None:
+                continue
+            if isinstance(cand, str) and cand.strip():
+                return cand
+            try:
+                maybe = getattr(cand, "user", None)
+                if isinstance(maybe, str) and maybe.strip():
+                    return maybe
+            except Exception:
+                pass
+        try:
+            return os.getlogin()
+        except Exception:
+            return ""
+
+    def _ensure_metadata_table(self, kernel, db_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS {table_full_name} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            command_name VARCHAR(255),
+            arguments TEXT,
+            execution_timestamp DATETIME,
+            affected_columns TEXT,
+            operation_status VARCHAR(50),
+            message TEXT,
+            db_name VARCHAR(255),
+            user_name VARCHAR(255)
+        );
+        """
+        try:
+            mariadb_client.run_statement(create_sql)
+            if mariadb_client.iserror():
+                log.error("Error creating magic_metadata table.")
+        except Exception as e:
+            log.error(f"Failed to ensure magic_metadata table: {e}")
+
+    def _insert_metadata(self, kernel, command_name, arguments, affected_columns,
+                         operation_status, message, db_name, user_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+
+        args_sql = self._sql_escape(arguments)
+        affected_sql = self._sql_escape(affected_columns)
+        status_sql = self._sql_escape(operation_status)
+        message_sql = self._sql_escape(message)
+        db_sql = self._sql_escape(db_name)
+        user_sql = self._sql_escape(user_name)
+
+        insert_sql = f"""
+        INSERT INTO {table_full_name}
+            (command_name, arguments, execution_timestamp, affected_columns,
+             operation_status, message, db_name, user_name)
+        VALUES (
+            {self._sql_escape(command_name)},
+            {args_sql},
+            NOW(),
+            {affected_sql},
+            {status_sql},
+            {message_sql},
+            {db_sql},
+            {user_sql}
+        );
+        """
+        try:
+            mariadb_client.run_statement(insert_sql)
+            if mariadb_client.iserror():
+                log.error("Error inserting into magic_metadata.")
+        except Exception as e:
+            log.error(f"Exception while inserting metadata: {e}")
+    # ---------------- end metadata helpers ----------------
+
     def execute(self, kernel, data):
         df = data.get("last_select")
+
+        # prepare metadata context
+        db_name = self._get_db_name(kernel)
+        user_name = self._get_user_name(kernel)
+        try:
+            self._ensure_metadata_table(kernel, db_name)
+        except Exception:
+            try:
+                kernel._send_message("stdout", "Warning: failed to ensure metadata table (continuing).")
+            except Exception:
+                pass
+
         if df is None or df.empty:
-            kernel._send_message("stderr", "No last_select found or DataFrame is empty.")
+            msg = "No last_select found or DataFrame is empty."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         try:
             args = self.parse_args(self.args)
         except Exception:
-            kernel._send_message("stderr", "Error parsing arguments. Use key=value syntax.")
+            msg = "Error parsing arguments. Use key=value syntax."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         # Defaults
@@ -118,7 +290,21 @@ class SplitData(MariaMagic):
         # Validate dataset
         n_total = len(df)
         if n_total == 0:
-            kernel._send_message("stderr", "DataFrame has no rows to split.")
+            msg = "DataFrame has no rows to split."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         # Helper to interpret sizes (int count or fraction)
@@ -147,21 +333,64 @@ class SplitData(MariaMagic):
             test_frac = interpret_size(test_size_arg, n_total)
             val_frac = interpret_size(val_size_arg, n_total)
         except ValueError as e:
-            kernel._send_message("stderr", f"Error interpreting sizes: {e}")
+            msg = f"Error interpreting sizes: {e}"
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         if test_frac + val_frac >= 1.0:
-            kernel._send_message("stderr", "Sum of test_size and val_size must be less than 1.0.")
+            msg = "Sum of test_size and val_size must be less than 1.0."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         # Prepare stratify arrays if requested
         stratify_arr = None
         if stratify_col:
             if stratify_col not in df.columns:
-                kernel._send_message("stderr", f"Stratify column '{stratify_col}' not found in DataFrame.")
+                msg = f"Stratify column '{stratify_col}' not found in DataFrame."
+                kernel._send_message("stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=self.args if isinstance(self.args, str) else str(self.args),
+                        affected_columns="",
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return
             stratify_arr = df[stratify_col].values
 
+        # Run splits
         try:
             # First split off the test set (test_frac of original)
             if test_frac > 0:
@@ -181,10 +410,7 @@ class SplitData(MariaMagic):
                 train_df = train_val_df
                 val_df = pd.DataFrame(columns=df.columns)
             else:
-                # We need to compute val fraction relative to the remaining (train_val_df).
-                # val_frac was relative to original; relative fraction = val_frac / (1 - test_frac)
                 rel_val_frac = val_frac / (1.0 - test_frac)
-                # For stratify on second split, use stratify column restricted to train_val_df if provided
                 stratify_arr_second = None
                 if stratify_arr is not None:
                     stratify_arr_second = train_val_df[stratify_col].values
@@ -196,13 +422,12 @@ class SplitData(MariaMagic):
                     stratify=stratify_arr_second if stratify_arr_second is not None else None
                 )
 
-            # Store results in data dict
+            # Store results in data dict under requested names
             data[test_name] = test_df
             data[val_name] = val_df
             data[train_name] = train_df
 
             if inplace:
-                # follow behavior of other magics: set last_select to training set
                 data["last_select"] = train_df
 
             # Report sizes
@@ -213,7 +438,6 @@ class SplitData(MariaMagic):
             kernel._send_message("stdout", msg)
 
             # Display small previews
-            # Show train + validation (if exists) and test
             try:
                 if not train_df.empty:
                     self._send_html(kernel, train_df.head(20), title=f"Train ({len(train_df)} rows)")
@@ -222,9 +446,47 @@ class SplitData(MariaMagic):
                 if not test_df.empty:
                     self._send_html(kernel, test_df.head(20), title=f"Test ({len(test_df)} rows)")
             except Exception:
-                # non-fatal; already stored the DataFrames
                 pass
 
+            # Insert metadata (success)
+            try:
+                args_for_db = self.args if isinstance(self.args, str) else str(self.args)
+                affected_columns = stratify_col if stratify_col else "ALL_COLUMNS"
+                message = (
+                    f"train_name={train_name}, test_name={test_name}, val_name={val_name}\n"
+                    f"train_count={len(train_df)}, test_count={len(test_df)}, val_count={len(val_df)}\n"
+                    f"test_frac={test_frac}, val_frac={val_frac}, shuffle={shuffle}, random_state={random_state}"
+                )
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=args_for_db,
+                    affected_columns=affected_columns,
+                    operation_status="success",
+                    message=message,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                try:
+                    kernel._send_message("stdout", "Warning: failed to write metadata (continuing).")
+                except Exception:
+                    pass
+
         except Exception as e:
-            kernel._send_message("stderr", f"Error during splitting: {e}")
+            msg = f"Error during splitting: {e}"
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=stratify_col if stratify_col else "",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
