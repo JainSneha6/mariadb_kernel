@@ -31,6 +31,8 @@ from mariadb_kernel.maria_magics.ml_commands.model_training.loadmodel import Loa
 from mariadb_kernel.maria_magics.ml_commands.model_training.predict import Predict
 from mariadb_kernel.maria_magics.ml_commands.ml_pipeline.ml_pipeline import MLPipeline
 from mariadb_kernel.maria_magics.ml_commands.model_training.maria_ingest import MariaIngest
+from mariadb_kernel.maria_magics.ml_commands.model_training.maria_search import MariaSearch
+from mariadb_kernel.maria_magics.ml_commands.model_training.maria_rag_query import MariaRAGQuery
 
 def get():
     return {
@@ -60,5 +62,7 @@ def get():
         "select_features": SelectFeatures,
         "select_model": SelectModel,
         "ml_pipeline": MLPipeline,
-        "maria_ingest": MariaIngest
+        "maria_ingest": MariaIngest,
+        "maria_search": MariaSearch,
+        "maria_rag_query": MariaRAGQuery,
     }
