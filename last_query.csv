@@ -1,9 +1,11 @@
-id,name,department,age,salary
-1,Alice,HR,30.0,50000.0
-2,Bob,Unknown,40.0,61000.0
-3,Charlie,Engineering,36.142857142857146,70000.0
-4,David,HR,25.0,48000.0
-5,Eve,Unknown,35.0,61000.0
-6,Frank,Engineering,28.0,72000.0
-7,Unknown,Sales,50.0,61000.0
-8,Grace,Sales,45.0,65000.0
+emp_id,name,department_HR,department_Engineering,department_Sales,department_NULL,department_Finance,department,age,gender,education_level,years_experience,projects_completed,avg_project_score,certifications,training_hours,overtime_hours,remote_ratio,salary,bonus,satisfaction_score,performance_rating,potential_score,attrition_flag
+1,Alice,1,0,0,0,0,HR,30,F,,5.0,12,87.5,1,40,5,0.2,55000.0,300.0,8.5,4,75.0,0
+2,Bob,0,1,0,0,0,Engineering,45,M,Masters,20.0,30,91.0,3,20,10,0.1,1200000.0,15000.0,9.0,5,89.0,0
+3,Charlie,0,0,1,0,0,Sales,38,M,Bachelors,,18,79.3,0,15,20,0.5,80000.0,7000.0,7.2,3,70.0,1
+4,Diana,0,1,0,0,0,Engineering,29,F,PhD,6.0,22,95.2,2,50,2,0.0,97000.0,10000.0,9.6,5,95.0,0
+5,Eve,0,0,0,1,0,,35,F,Bachelors,8.0,15,88.0,1,30,6,0.3,90000.0,8000.0,8.0,4,85.0,0
+6,Frank,1,0,0,0,0,HR,50,M,High School,25.0,8,72.5,0,10,15,0.7,60000.0,4000.0,6.5,2,60.0,1
+7,Grace,0,0,1,0,0,Sales,42,F,Bachelors,18.0,20,81.4,1,25,12,0.4,85000.0,7000.0,7.8,3,74.0,0
+8,Henry,0,1,0,0,0,Engineering,31,M,Masters,7.0,25,93.1,2,35,5,0.2,95000.0,9000.0,9.1,5,90.0,0
+9,Ivy,0,0,0,0,1,Finance,27,F,Bachelors,3.0,10,85.0,0,20,8,0.6,70000.0,5000.0,8.2,4,82.0,0
+10,Jack,0,0,1,0,0,Sales,55,M,High School,30.0,12,68.9,0,5,25,0.8,65000.0,2000.0,5.5,1,50.0,1
