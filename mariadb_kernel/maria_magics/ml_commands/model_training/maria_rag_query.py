@@ -2,7 +2,7 @@
 """
 %maria_rag_query
 
-Single-command RAG: retrieve relevant chunks, run fusion chain (LLM via Gemini) and return answer + sources.
+Single-command RAG: retrieve relevant chunks, run fusion chain (LLM via Gemini) and return answer.
 
 Hardcoded settings:
  - retriever = "hybrid"
@@ -548,7 +548,7 @@ class MariaRAGQuery(MariaMagic):
         scored.sort(key=lambda r: r["score"], reverse=True)
         topk = scored[: self.K]
 
-        # assemble context blocks with citations
+        # assemble context blocks with citations (internal only)
         context_blocks = []
         for s in topk:
             context_blocks.append({
@@ -568,7 +568,7 @@ class MariaRAGQuery(MariaMagic):
             context_text += f"--- SOURCE {i+1} {citation} ---\n{b['chunk_text']}\n\n"
 
         system_prompt = "You are a helpful assistant that answers questions based on provided documents. When you use information from a source include a citation tag like [DOCID::chunk_X]."
-        user_prompt = f"QUESTION:\n{query}\n\nCONTEXT:\n{context_text}\n\nINSTRUCTIONS:\nAnswer the question concisely, and at the end provide a 'SOURCES' section listing the doc_id and chunk_index you used.\n"
+        user_prompt = f"QUESTION:\n{query}\n\nCONTEXT:\n{context_text}\n\nINSTRUCTIONS:\nAnswer the question concisely.\n"
 
         # Try Gemini via google.genai
         llm_answer = None
@@ -582,22 +582,14 @@ class MariaRAGQuery(MariaMagic):
         if not llm_answer:
             ans, evidence, debug = self._fusion_chain_local(query, context_blocks)
             chain_debug = debug
-            sources_lines = []
-            for e in evidence:
-                sources_lines.append(f"{e['doc_id']}::chunk_{e['chunk_index']} - {e['snippet'][:200]}")
-            sources_text = "\n".join(sources_lines) if sources_lines else "No explicit sources found."
-            llm_answer = f"{ans}\n\nSOURCES:\n{sources_text}"
+            # **DO NOT** append sources to the answer (per request)
+            llm_answer = ans
 
-        # Output answer + sources
+        # Output answer only (no sources printed)
         kernel._send_message("stdout", "\n=== ANSWER ===\n")
         kernel._send_message("stdout", llm_answer + "\n\n")
 
-        kernel._send_message("stdout", "=== SOURCES (top-K) ===\n")
-        for b in context_blocks:
-            snippet = (b["chunk_text"] or "").replace("\n", " ")
-            if len(snippet) > 300:
-                snippet = snippet[:297] + "..."
-            kernel._send_message("stdout", f"- {b['doc_id']} :: chunk_{b['chunk_index']} (score={b['score']:.4f}, vec_sim={b['vec_sim']:.4f}, bm25={b['bm25']:.4f})\n  {snippet}\n")
+        # NOTE: sources are intentionally NOT printed here.
 
         if explain:
             kernel._send_message("stdout", "\n=== EXPLAIN: retrieval candidates (top 20 shown) ===\n")

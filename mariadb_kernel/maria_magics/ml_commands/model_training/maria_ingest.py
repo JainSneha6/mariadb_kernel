@@ -44,11 +44,7 @@ class MariaIngest(MariaMagic):
     """
     Ingest text documents into MariaDB, chunk them, and store embeddings.
 
-    Behavior:
-      - Accepts text via `text=...` arg, cell body, or `text_file=...` path.
-      - Uses native VECTOR insert when server VECTOR dim matches embedding dim.
-      - If server VECTOR dim differs or native insert fails, falls back to embeddings_json (JSON).
-      - Verifies inserts by SELECT COUNT(*) for chunk_id; falls back automatically if verification fails.
+    This variant reduces noisy logging and prints only important status/warnings.
     """
     def __init__(self, args=""):
         self.args = args
@@ -61,7 +57,7 @@ class MariaIngest(MariaMagic):
         return "maria_ingest"
 
     def help(self):
-        return "Ingest docs -> chunk -> embeddings. Uses native VECTOR when compatible; otherwise falls back to JSON."
+        return "Ingest docs -> chunk -> embeddings. Uses native VECTOR when compatible; otherwise falls back to JSON. (cleaned logs)"
 
     # ---- utilities ----
     def _str_to_obj(self, s):
@@ -258,7 +254,6 @@ class MariaIngest(MariaMagic):
             resp = mariadb_client.run_statement("SHOW CREATE TABLE embeddings;")
             if not resp:
                 return None
-            # try to parse HTML first
             txt = str(resp)
             m = re.search(r"embedding_vector\s+vector\((\d+)\)", txt, flags=re.I)
             if m:
@@ -266,7 +261,6 @@ class MariaIngest(MariaMagic):
                     return int(m.group(1))
                 except Exception:
                     return None
-            # fallback: plain text search
             m2 = re.search(r"vector\((\d+)\)", txt, flags=re.I)
             if m2:
                 try:
@@ -279,6 +273,9 @@ class MariaIngest(MariaMagic):
 
     # ---- main execution ----
     def execute(self, kernel, data):
+        # collect user-facing warnings/errors to print concisely at the end
+        user_warnings = []
+
         # --- Extract cell content robustly ---
         cell_text = ""
         try:
@@ -304,11 +301,7 @@ class MariaIngest(MariaMagic):
             kernel._send_message("stderr", f"[debug] could not extract cell text: {e}\n")
             cell_text = ""
 
-        if cell_text:
-            cell_text = cell_text.strip()
-
-        preview = cell_text[:80].replace("\n", " ") + ("..." if len(cell_text) > 80 else "")
-        kernel._send_message("stdout", f"[debug] stored content length={len(cell_text)} preview={preview}\n")
+        cell_text = cell_text.strip() if cell_text else ""
 
         # --- Parse arguments ---
         try:
@@ -327,14 +320,14 @@ class MariaIngest(MariaMagic):
 
         if isinstance(provided_text, str) and provided_text.strip():
             cell_text = provided_text
-            kernel._send_message("stdout", f"[debug] using text from args (len={len(cell_text)})\n")
+            kernel._send_message("stdout", f"Using text from args (len={len(cell_text)})\n")
         elif file_arg:
             file_contents, warnings = self._read_file_content(file_arg)
             for w in warnings:
-                kernel._send_message("stderr", f"[warning] {w}\n")
+                user_warnings.append(w)
             if file_contents:
                 cell_text = file_contents
-                kernel._send_message("stdout", f"[debug] using file content from {file_arg} (len={len(cell_text)})\n")
+                kernel._send_message("stdout", f"Using file content from {file_arg} (len={len(cell_text)})\n")
             else:
                 kernel._send_message("stderr", f"Failed to read file or file contained no text: {file_arg}\n")
 
@@ -404,8 +397,7 @@ class MariaIngest(MariaMagic):
         try:
             db_name_html = mariadb_client.run_statement("SELECT DATABASE();")
             dbname = self._parse_single_result(db_name_html) or ""
-            kernel._send_message("stdout", f"[debug] database detection raw response: {repr(db_name_html)[:400]}...\n")
-            kernel._send_message("stdout", f"[debug] using database: {dbname}\n")
+            kernel._send_message("stdout", f"Using database: {dbname}\n")
         except Exception as e:
             kernel._send_message("stderr", f"Failed to query current database: {e}\n")
             return
@@ -467,15 +459,11 @@ class MariaIngest(MariaMagic):
         existing_vec_dim = self._get_existing_vector_dim(mariadb_client, dbname)
         use_native_vector = True
         if existing_vec_dim is None:
-            # no existing vector column found or couldn't parse; assume native insert possible with our requested dim
             use_native_vector = True
-            kernel._send_message("stdout", "[debug] no existing vector dim detected; will attempt native VECTOR insert.\n")
         else:
             if existing_vec_dim != embedding_dim:
                 use_native_vector = False
-                kernel._send_message("stderr", f"[warning] embeddings.embedding_vector exists with dim={existing_vec_dim}; ingest embedding_dim={embedding_dim}. Native VECTOR insert will be skipped and fallback to embeddings_json will be used.\n")
-            else:
-                kernel._send_message("stdout", f"[debug] embeddings.embedding_vector dim matches expected ({embedding_dim}); will use native VECTOR inserts.\n")
+                user_warnings.append(f"embeddings.embedding_vector exists with dim={existing_vec_dim}; ingest dim={embedding_dim}. Will use JSON fallback.")
 
         # ensure embeddings_json exists (fallback)
         try:
@@ -492,12 +480,17 @@ class MariaIngest(MariaMagic):
                 """
             )
         except Exception:
-            # nonfatal; we will try to create later when needed
             pass
 
-        # ingest loop
+        # ingest loop with concise counters
         total_chunks = 0
         total_emb_rows = 0
+        native_attempts = 0
+        native_successes = 0
+        native_failures = 0
+        fallback_successes = 0
+        fallback_failures = 0
+
         for doc in docs_to_ingest:
             d_doc_id = doc.get("doc_id")
             d_title = doc.get("title")
@@ -506,29 +499,16 @@ class MariaIngest(MariaMagic):
 
             # insert document row
             try:
-                res = mariadb_client.run_statement(
+                mariadb_client.run_statement(
                     f"""
                     INSERT INTO `{dbname}`.`documents` (doc_id, title, content, metadata)
                     VALUES ({self._sql_escape(d_doc_id)}, {self._sql_escape(d_title)}, {self._sql_escape(d_content)}, {self._sql_escape(json.dumps(d_meta))})
                     ON DUPLICATE KEY UPDATE title=VALUES(title), content=VALUES(content), metadata=VALUES(metadata);
                     """
                 )
-                kernel._send_message("stdout", f"[debug] INSERT documents raw response: {repr(res)[:400]}...\n")
             except Exception as e:
-                kernel._send_message("stderr", f"Failed to insert document {d_doc_id}: {e}\n")
+                user_warnings.append(f"Failed to insert document {d_doc_id}: {e}")
                 continue
-
-            # verify stored content
-            try:
-                res_html = mariadb_client.run_statement(
-                    f"SELECT content FROM `{dbname}`.`documents` WHERE doc_id = {self._sql_escape(d_doc_id)} LIMIT 1;"
-                )
-                stored_content = self._parse_single_result(res_html) or ""
-                kernel._send_message("stdout", f"[debug] stored content length={len(stored_content)}\n")
-                if d_content and not stored_content:
-                    kernel._send_message("stderr", "[warning] document content inserted into DB appears empty (possible client/encoding issue).\n")
-            except Exception as e:
-                kernel._send_message("stderr", f"Warning: could not verify stored document content: {e}\n")
 
             # chunk
             chunks = self._simple_chunk(d_content, chunk_size, overlap)
@@ -540,13 +520,12 @@ class MariaIngest(MariaMagic):
             inserted_chunk_ids = []
             for idx, chunk_text in enumerate(chunks):
                 try:
-                    res = mariadb_client.run_statement(
+                    mariadb_client.run_statement(
                         f"""
                         INSERT INTO `{dbname}`.`chunks` (doc_id, chunk_index, chunk_text, chunk_meta)
                         VALUES ({self._sql_escape(d_doc_id)}, {idx}, {self._sql_escape(chunk_text)}, {self._sql_escape(json.dumps({}))});
                         """
                     )
-                    kernel._send_message("stdout", f"[debug] INSERT chunk idx={idx} raw response: {repr(res)[:400]}...\n")
                     # get last insert id (best-effort)
                     try:
                         last_html = mariadb_client.run_statement("SELECT LAST_INSERT_ID();")
@@ -566,7 +545,7 @@ class MariaIngest(MariaMagic):
                         except Exception:
                             inserted_chunk_ids.append((idx, None))
                 except Exception as e:
-                    kernel._send_message("stderr", f"Failed to insert chunk {idx} for {d_doc_id}: {e}\n")
+                    user_warnings.append(f"Failed to insert chunk {idx} for {d_doc_id}: {e}")
                     inserted_chunk_ids.append((idx, None))
                     continue
 
@@ -579,88 +558,79 @@ class MariaIngest(MariaMagic):
 
                 for (i, chunk_db_id), vec in zip(inserted_chunk_ids, embs_norm):
                     if chunk_db_id is None:
-                        self.log.debug("No db chunk id for doc %s chunk %d — skipping embedding store", d_doc_id, i)
-                        kernel._send_message("stderr", f"[debug] no chunk id for doc {d_doc_id} chunk {i}; embedding skipped.\n")
+                        user_warnings.append(f"No chunk id for doc {d_doc_id} chunk {i}; embedding skipped.")
                         continue
 
                     vec_list = [float(v) for v in vec.tolist()]
                     vec_literal = "[" + ",".join(repr(x) for x in vec_list) + "]"
 
-                    # If server vector dim mismatches, skip native insert
                     if not use_native_vector:
+                        # always use JSON fallback
                         try:
                             emb_json_literal = self._sql_escape(json.dumps(vec_list))
-                            res_json = mariadb_client.run_statement(
+                            mariadb_client.run_statement(
                                 f"""
                                 INSERT INTO `{dbname}`.`embeddings_json` (chunk_id, model, dim, embedding_json)
                                 VALUES ({chunk_db_id}, {self._sql_escape('all-MiniLM-L6-v2')}, {embedding_dim}, {emb_json_literal})
                                 ON DUPLICATE KEY UPDATE model=VALUES(model), dim=VALUES(dim), embedding_json=VALUES(embedding_json);
                                 """
                             )
-                            kernel._send_message("stdout", f"[debug] fallback INSERT embeddings_json raw response: {repr(res_json)[:400]}...\n")
                             # verify
                             try:
                                 verify_json = mariadb_client.run_statement(
                                     f"SELECT COUNT(*) FROM `{dbname}`.`embeddings_json` WHERE chunk_id = {chunk_db_id};"
                                 )
                                 cnt = self._parse_single_result(verify_json)
-                                kernel._send_message("stdout", f"[debug] verify embeddings_json COUNT for chunk {chunk_db_id}: {cnt}\n")
                                 if cnt and int(cnt) > 0:
+                                    fallback_successes += 1
                                     total_emb_rows += 1
-                                    kernel._send_message("stdout", f"[debug] fallback stored for chunk {chunk_db_id}\n")
                                 else:
-                                    kernel._send_message("stderr", f"[error] fallback JSON insert reported 0 rows for chunk {chunk_db_id}\n")
-                                continue
-                            except Exception as e_verify_json:
-                                kernel._send_message("stderr", f"[warning] verify embeddings_json select failed: {e_verify_json}\n")
-                                continue
+                                    fallback_failures += 1
+                            except Exception:
+                                fallback_failures += 1
                         except Exception as e_json:
-                            kernel._send_message("stderr", f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}\n")
-                            self.log.debug("Fallback JSON insert failed for chunk %s: %s", chunk_db_id, e_json)
-                            continue
+                            user_warnings.append(f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}")
+                            fallback_failures += 1
+                        continue
 
-                    # Attempt native VECTOR insert (server dim matched)
+                    # Attempt native VECTOR insert
+                    native_attempts += 1
                     try:
-                        res_native = mariadb_client.run_statement(
+                        mariadb_client.run_statement(
                             f"""
                             INSERT INTO `{dbname}`.`embeddings` (chunk_id, model, dim, embedding_vector)
                             VALUES ({chunk_db_id}, {self._sql_escape('all-MiniLM-L6-v2')}, {embedding_dim}, {vec_literal})
                             ON DUPLICATE KEY UPDATE model=VALUES(model), dim=VALUES(dim), embedding_vector=VALUES(embedding_vector);
                             """
                         )
-                        kernel._send_message("stdout", f"[debug] native INSERT embeddings raw response: {repr(res_native)[:400]}...\n")
                     except Exception as e_native:
-                        kernel._send_message("stderr", f"Failed to insert embedding (native VECTOR) for chunk_id={chunk_db_id}: {e_native}\n")
-                        self.log.debug("Native VECTOR insert failed for chunk %s: %s", chunk_db_id, e_native)
+                        native_failures += 1
                         # try fallback JSON
                         try:
                             emb_json_literal = self._sql_escape(json.dumps(vec_list))
-                            res_json = mariadb_client.run_statement(
+                            mariadb_client.run_statement(
                                 f"""
                                 INSERT INTO `{dbname}`.`embeddings_json` (chunk_id, model, dim, embedding_json)
                                 VALUES ({chunk_db_id}, {self._sql_escape('all-MiniLM-L6-v2')}, {embedding_dim}, {emb_json_literal})
                                 ON DUPLICATE KEY UPDATE model=VALUES(model), dim=VALUES(dim), embedding_json=VALUES(embedding_json);
                                 """
                             )
-                            kernel._send_message("stdout", f"[debug] fallback INSERT embeddings_json raw response: {repr(res_json)[:400]}...\n")
                             try:
                                 verify_json = mariadb_client.run_statement(
                                     f"SELECT COUNT(*) FROM `{dbname}`.`embeddings_json` WHERE chunk_id = {chunk_db_id};"
                                 )
                                 cnt = self._parse_single_result(verify_json)
-                                kernel._send_message("stdout", f"[debug] verify embeddings_json COUNT for chunk {chunk_db_id}: {cnt}\n")
                                 if cnt and int(cnt) > 0:
+                                    fallback_successes += 1
                                     total_emb_rows += 1
-                                    kernel._send_message("stdout", f"[debug] fallback stored for chunk {chunk_db_id}\n")
                                 else:
-                                    kernel._send_message("stderr", f"[error] fallback JSON insert reported 0 rows for chunk {chunk_db_id}\n")
-                                continue
-                            except Exception as e_verify_json:
-                                kernel._send_message("stderr", f"[warning] verify embeddings_json select failed: {e_verify_json}\n")
-                                continue
+                                    fallback_failures += 1
+                            except Exception:
+                                fallback_failures += 1
                         except Exception as e_json:
-                            kernel._send_message("stderr", f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}\n")
-                            continue
+                            user_warnings.append(f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}")
+                            fallback_failures += 1
+                        continue
 
                     # Verify native insert succeeded by COUNT(*)
                     try:
@@ -668,54 +638,68 @@ class MariaIngest(MariaMagic):
                             f"SELECT COUNT(*) FROM `{dbname}`.`embeddings` WHERE chunk_id = {chunk_db_id};"
                         )
                         cnt = self._parse_single_result(verify)
-                        kernel._send_message("stdout", f"[debug] verify embeddings COUNT for chunk {chunk_db_id}: {cnt}\n")
                         if cnt and int(cnt) > 0:
+                            native_successes += 1
                             total_emb_rows += 1
                         else:
-                            # fallback if native wrote no rows
-                            kernel._send_message("stderr", f"[warning] native insert wrote 0 rows for chunk {chunk_db_id}, falling back to JSON.\n")
+                            # fallback to JSON
+                            native_failures += 1
                             try:
                                 emb_json_literal = self._sql_escape(json.dumps(vec_list))
-                                res_json = mariadb_client.run_statement(
+                                mariadb_client.run_statement(
                                     f"""
                                     INSERT INTO `{dbname}`.`embeddings_json` (chunk_id, model, dim, embedding_json)
                                     VALUES ({chunk_db_id}, {self._sql_escape('all-MiniLM-L6-v2')}, {embedding_dim}, {emb_json_literal})
                                     ON DUPLICATE KEY UPDATE model=VALUES(model), dim=VALUES(dim), embedding_json=VALUES(embedding_json);
                                     """
                                 )
-                                kernel._send_message("stdout", f"[debug] fallback INSERT embeddings_json raw response: {repr(res_json)[:400]}...\n")
                                 try:
                                     verify_json = mariadb_client.run_statement(
                                         f"SELECT COUNT(*) FROM `{dbname}`.`embeddings_json` WHERE chunk_id = {chunk_db_id};"
                                     )
                                     cntj = self._parse_single_result(verify_json)
-                                    kernel._send_message("stdout", f"[debug] verify embeddings_json COUNT for chunk {chunk_db_id}: {cntj}\n")
                                     if cntj and int(cntj) > 0:
+                                        fallback_successes += 1
                                         total_emb_rows += 1
-                                except Exception as e_verify_json:
-                                    kernel._send_message("stderr", f"[warning] verify embeddings_json select failed: {e_verify_json}\n")
+                                    else:
+                                        fallback_failures += 1
+                                except Exception:
+                                    fallback_failures += 1
                             except Exception as e_json:
-                                kernel._send_message("stderr", f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}\n")
+                                user_warnings.append(f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}")
+                                fallback_failures += 1
                     except Exception as e_verify:
-                        kernel._send_message("stderr", f"[warning] verify select for embeddings failed: {e_verify}\n")
+                        user_warnings.append(f"Verify select for embeddings failed: {e_verify}")
 
         # Final diagnostics: counts & version
         try:
             cnt_emb = mariadb_client.run_statement("SELECT COUNT(*) FROM embeddings;")
-            kernel._send_message("stdout", f"[debug] COUNT embeddings raw response: {repr(cnt_emb)[:400]}...\n")
-        except Exception as e:
-            kernel._send_message("stderr", f"[warning] COUNT embeddings failed: {e}\n")
+            cnt_emb_val = self._parse_single_result(cnt_emb) or "0"
+        except Exception:
+            cnt_emb_val = "N/A"
         try:
             cnt_json = mariadb_client.run_statement("SELECT COUNT(*) FROM embeddings_json;")
-            kernel._send_message("stdout", f"[debug] COUNT embeddings_json raw response: {repr(cnt_json)[:400]}...\n")
+            cnt_json_val = self._parse_single_result(cnt_json) or "0"
         except Exception:
-            kernel._send_message("stdout", "[debug] COUNT embeddings_json query failed or table does not exist.\n")
+            cnt_json_val = "N/A"
         try:
             version = mariadb_client.run_statement("SELECT VERSION();")
-            kernel._send_message("stdout", f"[debug] VERSION raw response: {repr(version)[:400]}...\n")
+            version_val = self._parse_single_result(version) or ""
         except Exception:
-            pass
+            version_val = ""
 
-        kernel._send_message("stdout", f"Ingest complete. documents={len(docs_to_ingest)} chunks_total={total_chunks} embeddings_written={total_emb_rows}\n")
-        kernel._send_message("stdout", "Notes:\n - embedding model used: all-MiniLM-L6-v2 (dim={})\n - Native VECTOR column used only when compatible.\n".format(embedding_dim))
+        # concise output
+        kernel._send_message("stdout", (
+            "Ingest complete.\n"
+            f" documents={len(docs_to_ingest)}\n"
+            f" chunks_total={total_chunks}\n"
+            f" embeddings_written={total_emb_rows}\n"
+            f" Server version: {version_val}\n"
+        ))
+
+        # if user_warnings:
+        #     kernel._send_message("stderr", "Warnings/notes:\n")
+        #     for w in user_warnings:
+        #         kernel._send_message("stderr", f" - {w}\n")
+
         return
