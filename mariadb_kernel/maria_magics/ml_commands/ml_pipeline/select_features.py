@@ -10,6 +10,16 @@ from sklearn.feature_selection import SelectKBest, f_classif, f_regression, RFE,
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression, Lasso
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import logging
+import os
+import re
+
+# Optional helper to reliably get current DB name (if available)
+try:
+    from mariadb_kernel.sql_fetch import SqlFetch
+except Exception:
+    SqlFetch = None
+
 
 class SelectFeatures(MariaMagic):
     """
@@ -20,17 +30,10 @@ class SelectFeatures(MariaMagic):
 
     Identify the best features for training a model on data['last_select'].
     Uses all columns except the target column as features.
-    Methods:
-    - correlation: Absolute Pearson correlation with the target.
-    - rf_importance: RandomForest feature importance scores.
-    - rfe: Recursive Feature Elimination with a RandomForest model.
-    - mutual_info: Mutual Information between features and target.
-    - chi2: Chi-squared statistic (classification only, non-negative features).
-    - anova: ANOVA F-test for feature significance.
-    - l1_selection: L1-based feature selection (LogisticRegression for classification, Lasso for regression).
-    - variance: Remove features with low variance (threshold-based).
-    Stores the ranked features in data[output_name] and displays a table of results.
+
+    Execution metadata is recorded in table `magic_metadata`.
     """
+
     def __init__(self, args=""):
         self.args = args
 
@@ -43,6 +46,8 @@ class SelectFeatures(MariaMagic):
     def help(self):
         return "Identify the best features for model training from data['last_select']."
 
+
+    # -------------------- small utilities --------------------
     def _str_to_obj(self, s):
         try:
             return int(s)
@@ -83,17 +88,204 @@ class SelectFeatures(MariaMagic):
         except Exception:
             pass
 
+    # -------------------- metadata / DB helpers (best-effort) --------------------
+    def _get_mariadb_client(self, kernel):
+        return getattr(kernel, "mariadb_client", None)
+
+    def _get_logger(self, kernel):
+        return getattr(kernel, "log", logging.getLogger(__name__))
+
+    def _sql_escape(self, val):
+        """Escape a value for SQL single-quoted literal insert. None -> NULL"""
+        if val is None:
+            return "NULL"
+        if not isinstance(val, str):
+            val = str(val)
+        return "'" + val.replace("'", "''") + "'"
+
+    def _get_db_name(self, kernel):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+
+        # Try SqlFetch if available
+        if SqlFetch is not None and mariadb_client is not None:
+            try:
+                sf = SqlFetch(mariadb_client, log)
+                dbname = sf.get_db_name()
+                if isinstance(dbname, str):
+                    return dbname
+            except Exception:
+                log.debug("SqlFetch available but .get_db_name() failed; falling back.")
+
+        if mariadb_client is None:
+            return ""
+
+        try:
+            result = mariadb_client.run_statement("SELECT DATABASE();")
+            if mariadb_client.iserror() or not result:
+                return ""
+            # Try to parse HTML table with pandas
+            try:
+                dfs = pd.read_html(result)
+                if dfs and len(dfs) > 0:
+                    val = dfs[0].iloc[0, 0]
+                    if isinstance(val, float) and pd.isna(val):
+                        return ""
+                    return str(val) if val is not None else ""
+            except Exception:
+                m = re.search(r"<td.*?>(.*?)</td>", str(result), flags=re.S | re.I)
+                if m:
+                    txt = re.sub(r"<.*?>", "", m.group(1)).strip()
+                    if txt.lower() == "null" or txt == "":
+                        return ""
+                    return txt
+                txt = str(result).strip()
+                if txt.lower() == "null" or txt == "":
+                    return ""
+                return txt
+        except Exception:
+            return ""
+        return ""
+
+    def _get_user_name(self, kernel):
+        candidates = [
+            getattr(kernel, "user_name", None),
+            getattr(kernel, "username", None),
+            getattr(kernel, "user", None),
+            getattr(kernel, "session", None),
+        ]
+        for cand in candidates:
+            if cand is None:
+                continue
+            if isinstance(cand, str) and cand.strip():
+                return cand
+            try:
+                maybe = getattr(cand, "user", None)
+                if isinstance(maybe, str) and maybe.strip():
+                    return maybe
+            except Exception:
+                pass
+        try:
+            return os.getlogin()
+        except Exception:
+            return ""
+
+    def _ensure_metadata_table(self, kernel, db_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS {table_full_name} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            command_name VARCHAR(255),
+            arguments TEXT,
+            execution_timestamp DATETIME,
+            affected_columns TEXT,
+            operation_status VARCHAR(50),
+            message TEXT,
+            db_name VARCHAR(255),
+            user_name VARCHAR(255)
+        );
+        """
+        try:
+            mariadb_client.run_statement(create_sql)
+            if mariadb_client.iserror():
+                log.error("Error creating magic_metadata table.")
+        except Exception as e:
+            log.error(f"Failed to ensure magic_metadata table: {e}")
+
+    def _insert_metadata(self, kernel, command_name, arguments, affected_columns,
+                         operation_status, message, db_name, user_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+
+        args_sql = self._sql_escape(arguments)
+        affected_sql = self._sql_escape(affected_columns)
+        status_sql = self._sql_escape(operation_status)
+        message_sql = self._sql_escape(message)
+        db_sql = self._sql_escape(db_name)
+        user_sql = self._sql_escape(user_name)
+
+        insert_sql = f"""
+        INSERT INTO {table_full_name}
+            (command_name, arguments, execution_timestamp, affected_columns,
+             operation_status, message, db_name, user_name)
+        VALUES (
+            {self._sql_escape(command_name)},
+            {args_sql},
+            NOW(),
+            {affected_sql},
+            {status_sql},
+            {message_sql},
+            {db_sql},
+            {user_sql}
+        );
+        """
+        try:
+            mariadb_client.run_statement(insert_sql)
+            if mariadb_client.iserror():
+                log.error("Error inserting into magic_metadata.")
+        except Exception as e:
+            log.error(f"Exception while inserting metadata: {e}")
+
+    # -------------------- end metadata helpers --------------------
+
+
     def execute(self, kernel, data):
+        # Prepare metadata context early
+        db_name = self._get_db_name(kernel)
+        user_name = self._get_user_name(kernel)
+        try:
+            self._ensure_metadata_table(kernel, db_name)
+        except Exception:
+            try:
+                kernel._send_message("stdout", "Warning: failed to ensure metadata table (continuing).")
+            except Exception:
+                pass
+
         # Load training DataFrame
         df = data.get("last_select")
         if df is None or df.empty:
-            kernel._send_message("stderr", "No last_select found or DataFrame is empty.")
+            msg = "No last_select found or DataFrame is empty."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         try:
             args = self.parse_args(self.args)
         except Exception:
-            kernel._send_message("stderr", "Error parsing arguments. Use key=value syntax.")
+            msg = "Error parsing arguments. Use key=value syntax."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         target = args.get("target")
@@ -104,24 +296,80 @@ class SelectFeatures(MariaMagic):
         inplace = bool(args.get("inplace", True))
 
         if not target:
-            kernel._send_message("stderr", "target argument is required (target=target_col).")
+            msg = "target argument is required (target=target_col)."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         if target not in df.columns:
-            kernel._send_message("stderr", f"Target column '{target}' not found in DataFrame.")
+            msg = f"Target column '{target}' not found in DataFrame."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         # Use all columns except the target as features
         features = [col for col in df.columns if col != target]
         if not features:
-            kernel._send_message("stderr", "No features available after excluding target column.")
+            msg = "No features available after excluding target column."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         # Determine problem type
         if problem_override:
             problem = problem_override.lower()
             if problem not in ("classification", "regression"):
-                kernel._send_message("stderr", "problem must be 'classification' or 'regression'.")
+                msg = "problem must be 'classification' or 'regression'."
+                kernel._send_message("stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=self.args if isinstance(self.args, str) else str(self.args),
+                        affected_columns="",
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return
         else:
             tgt_ser = df[target]
@@ -141,9 +389,45 @@ class SelectFeatures(MariaMagic):
         y = df[target].copy()
 
         # Handle missing values (simple imputation for feature selection)
-        X = X.fillna(X.mean(numeric_only=True)) if problem == "regression" else X.fillna(X.mode().iloc[0])
+        try:
+            if problem == "regression":
+                X = X.fillna(X.mean(numeric_only=True))
+            else:
+                X = X.fillna(X.mode().iloc[0])
+        except Exception:
+            msg = "Features contain non-numeric data or unhandled missing values."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(features),
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
+            return
+
         if X.isna().any().any():
-            kernel._send_message("stderr", "Features contain non-numeric data or unhandled missing values.")
+            msg = "Features contain non-numeric data or unhandled missing values."
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(features),
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         # Scale data for methods that require it
@@ -152,7 +436,21 @@ class SelectFeatures(MariaMagic):
             try:
                 X = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
             except Exception as e:
-                kernel._send_message("stderr", f"Error scaling data: {e}")
+                msg = f"Error scaling data: {e}"
+                kernel._send_message("stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=self.args if isinstance(self.args, str) else str(self.args),
+                        affected_columns=",".join(features),
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return
 
         # Feature selection
@@ -204,10 +502,38 @@ class SelectFeatures(MariaMagic):
 
             elif method == "chi2":
                 if problem != "classification":
-                    kernel._send_message("stderr", "chi2 method is only for classification problems.")
+                    msg = "chi2 method is only for classification problems."
+                    kernel._send_message("stderr", msg)
+                    try:
+                        self._insert_metadata(
+                            kernel=kernel,
+                            command_name=self.name(),
+                            arguments=self.args if isinstance(self.args, str) else str(self.args),
+                            affected_columns=",".join(features),
+                            operation_status="error",
+                            message=msg,
+                            db_name=db_name,
+                            user_name=user_name
+                        )
+                    except Exception:
+                        pass
                     return
                 if (X < 0).any().any():
-                    kernel._send_message("stderr", "chi2 requires non-negative features.")
+                    msg = "chi2 requires non-negative features."
+                    kernel._send_message("stderr", msg)
+                    try:
+                        self._insert_metadata(
+                            kernel=kernel,
+                            command_name=self.name(),
+                            arguments=self.args if isinstance(self.args, str) else str(self.args),
+                            affected_columns=",".join(features),
+                            operation_status="error",
+                            message=msg,
+                            db_name=db_name,
+                            user_name=user_name
+                        )
+                    except Exception:
+                        pass
                     return
                 selector = SelectKBest(score_func=chi2, k=k)
                 selector.fit(X, y)
@@ -254,14 +580,42 @@ class SelectFeatures(MariaMagic):
                 })
 
             else:
-                kernel._send_message("stderr", "method must be one of 'correlation', 'rf_importance', 'rfe', 'mutual_info', 'chi2', 'anova', 'l1_selection', or 'variance'.")
+                msg = "method must be one of 'correlation', 'rf_importance', 'rfe', 'mutual_info', 'chi2', 'anova', 'l1_selection', or 'variance'."
+                kernel._send_message("stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=self.args if isinstance(self.args, str) else str(self.args),
+                        affected_columns=",".join(features),
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return
 
         except Exception as e:
-            kernel._send_message("stderr", f"Error during feature selection: {e}")
+            msg = f"Error during feature selection: {e}"
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(features),
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
-        # Store results
+        # Store results in data dict
         try:
             data[output_name] = selected_features
             data[output_name + "_meta"] = {
@@ -272,11 +626,51 @@ class SelectFeatures(MariaMagic):
                 "all_scores": result_df.to_dict()
             }
         except Exception as e:
-            kernel._send_message("stderr", f"Error storing results: {e}")
+            msg = f"Error storing results: {e}"
+            kernel._send_message("stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(selected_features) if 'selected_features' in locals() else "",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return
 
         # Display results
-        self._send_html(kernel, result_df, title=f"Feature Selection Results (method={method})")
-        kernel._send_message("stdout", f"Selected {len(selected_features)} features saved to data['{output_name}']: {', '.join(selected_features)}")
+        try:
+            self._send_html(kernel, result_df, title=f"Feature Selection Results (method={method})")
+        except Exception:
+            pass
+
+        success_msg = f"Selected {len(selected_features)} features saved to data['{output_name}']: {', '.join(selected_features)}"
+        kernel._send_message("stdout", success_msg)
+
+        # Insert metadata (best-effort)
+        try:
+            args_for_db = self.args if isinstance(self.args, str) else str(self.args)
+            affected_columns_str = ",".join(selected_features)
+            message_str = success_msg
+            self._insert_metadata(
+                kernel=kernel,
+                command_name=self.name(),
+                arguments=args_for_db,
+                affected_columns=affected_columns_str,
+                operation_status="success",
+                message=message_str,
+                db_name=db_name,
+                user_name=user_name
+            )
+        except Exception:
+            try:
+                kernel._send_message("stdout", "Warning: failed to write metadata (continuing).")
+            except Exception:
+                pass
 
         return
