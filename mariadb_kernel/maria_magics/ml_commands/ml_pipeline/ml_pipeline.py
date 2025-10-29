@@ -8,6 +8,9 @@ from distutils import util
 import pandas as pd
 import numpy as np
 import json
+import logging
+import os
+import re
 
 # Import the other pipeline stages (paths kept as in your original snippet)
 from mariadb_kernel.maria_magics.ml_commands.data_cleaning.missing import Missing
@@ -19,12 +22,19 @@ from mariadb_kernel.maria_magics.ml_commands.data_cleaning.clipoutliers import C
 from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.encode import Encode
 from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.normalize import Normalize
 from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.standardize import Standardize
+from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.splitdata import SplitData  # placeholder safety
 from mariadb_kernel.maria_magics.ml_commands.data_preprocessing.splitdata import SplitData
 from mariadb_kernel.maria_magics.ml_commands.model_training.train_model import TrainModel
 from mariadb_kernel.maria_magics.ml_commands.model_training.evaluate_model import EvaluateModel
 from mariadb_kernel.maria_magics.ml_commands.model_training.savemodel import SaveModel
 from mariadb_kernel.maria_magics.ml_commands.ml_pipeline.select_features import SelectFeatures
 from mariadb_kernel.maria_magics.ml_commands.ml_pipeline.select_model import SelectModel
+
+# Optional helper to reliably get current DB name (if available)
+try:
+    from mariadb_kernel.sql_fetch import SqlFetch
+except Exception:
+    SqlFetch = None
 
 
 class MLPipeline(MariaMagic):
@@ -90,16 +100,205 @@ class MLPipeline(MariaMagic):
     def _send_message(self, kernel, channel, message):
         kernel._send_message(channel, f"[MLPipeline] {message}")
 
+    # -------------------- metadata / DB helpers (best-effort) --------------------
+    def _get_mariadb_client(self, kernel):
+        return getattr(kernel, "mariadb_client", None)
+
+    def _get_logger(self, kernel):
+        return getattr(kernel, "log", logging.getLogger(__name__))
+
+    def _sql_escape(self, val):
+        """Escape a value for SQL single-quoted literal insert. None -> NULL"""
+        if val is None:
+            return "NULL"
+        if not isinstance(val, str):
+            val = str(val)
+        return "'" + val.replace("'", "''") + "'"
+
+    def _get_db_name(self, kernel):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+
+        # Try SqlFetch if available
+        if SqlFetch is not None and mariadb_client is not None:
+            try:
+                sf = SqlFetch(mariadb_client, log)
+                dbname = sf.get_db_name()
+                if isinstance(dbname, str):
+                    return dbname
+            except Exception:
+                log.debug("SqlFetch available but .get_db_name() failed; falling back.")
+
+        if mariadb_client is None:
+            return ""
+
+        try:
+            result = mariadb_client.run_statement("SELECT DATABASE();")
+            if mariadb_client.iserror() or not result:
+                return ""
+            # Try to parse HTML table with pandas
+            try:
+                dfs = pd.read_html(result)
+                if dfs and len(dfs) > 0:
+                    val = dfs[0].iloc[0, 0]
+                    if isinstance(val, float) and pd.isna(val):
+                        return ""
+                    return str(val) if val is not None else ""
+            except Exception:
+                m = re.search(r"<td.*?>(.*?)</td>", str(result), flags=re.S | re.I)
+                if m:
+                    txt = re.sub(r"<.*?>", "", m.group(1)).strip()
+                    if txt.lower() == "null" or txt == "":
+                        return ""
+                    return txt
+                txt = str(result).strip()
+                if txt.lower() == "null" or txt == "":
+                    return ""
+                return txt
+        except Exception:
+            return ""
+        return ""
+
+    def _get_user_name(self, kernel):
+        candidates = [
+            getattr(kernel, "user_name", None),
+            getattr(kernel, "username", None),
+            getattr(kernel, "user", None),
+            getattr(kernel, "session", None),
+        ]
+        for cand in candidates:
+            if cand is None:
+                continue
+            if isinstance(cand, str) and cand.strip():
+                return cand
+            try:
+                maybe = getattr(cand, "user", None)
+                if isinstance(maybe, str) and maybe.strip():
+                    return maybe
+            except Exception:
+                pass
+        try:
+            return os.getlogin()
+        except Exception:
+            return ""
+
+    def _ensure_metadata_table(self, kernel, db_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS {table_full_name} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            command_name VARCHAR(255),
+            arguments TEXT,
+            execution_timestamp DATETIME,
+            affected_columns TEXT,
+            operation_status VARCHAR(50),
+            message TEXT,
+            db_name VARCHAR(255),
+            user_name VARCHAR(255),
+            rollback_token VARCHAR(255),
+            backup_table VARCHAR(255),
+            original_table VARCHAR(255)
+        );
+        """
+        try:
+            mariadb_client.run_statement(create_sql)
+            if mariadb_client.iserror():
+                log.error("Error creating magic_metadata table.")
+        except Exception as e:
+            log.error(f"Failed to ensure magic_metadata table: {e}")
+
+    def _insert_metadata(self, kernel, command_name, arguments, affected_columns,
+                         operation_status, message, db_name, user_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+
+        args_sql = self._sql_escape(arguments)
+        affected_sql = self._sql_escape(affected_columns)
+        status_sql = self._sql_escape(operation_status)
+        message_sql = self._sql_escape(message)
+        db_sql = self._sql_escape(db_name)
+        user_sql = self._sql_escape(user_name)
+
+        insert_sql = f"""
+        INSERT INTO {table_full_name}
+            (command_name, arguments, execution_timestamp, affected_columns,
+             operation_status, message, db_name, user_name)
+        VALUES (
+            {self._sql_escape(command_name)},
+            {args_sql},
+            NOW(),
+            {affected_sql},
+            {status_sql},
+            {message_sql},
+            {db_sql},
+            {user_sql}
+        );
+        """
+        try:
+            mariadb_client.run_statement(insert_sql)
+            if mariadb_client.iserror():
+                log.error("Error inserting into magic_metadata.")
+        except Exception as e:
+            log.error(f"Exception while inserting metadata: {e}")
+
+    # -------------------- end metadata helpers --------------------
+
     def execute(self, kernel, data):
+        # Prepare metadata context early
+        db_name = self._get_db_name(kernel)
+        user_name = self._get_user_name(kernel)
+        try:
+            self._ensure_metadata_table(kernel, db_name)
+        except Exception:
+            try:
+                kernel._send_message("stdout", "Warning: failed to ensure metadata table (continuing).")
+            except Exception:
+                pass
+
         df = data.get("last_select")
         if df is None or df.empty:
-            self._send_message(kernel, "stderr", "No last_select found or DataFrame is empty.")
+            msg = "No last_select found or DataFrame is empty."
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
         try:
             args = self.parse_args(self.args)
         except Exception as e:
-            self._send_message(kernel, "stderr", f"Error parsing arguments: {e}. Use key=value syntax.")
+            msg = f"Error parsing arguments: {e}. Use key=value syntax."
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
         # Parse arguments
@@ -111,16 +310,72 @@ class MLPipeline(MariaMagic):
 
         # Validate required arguments
         if not target:
-            self._send_message(kernel, "stderr", "target argument is required (target=target_col).")
+            msg = "target argument is required (target=target_col)."
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
         if not problem:
-            self._send_message(kernel, "stderr", "problem argument is required (problem=classification|regression).")
+            msg = "problem argument is required (problem=classification|regression)."
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
         if problem not in ("classification", "regression"):
-            self._send_message(kernel, "stderr", "problem must be 'classification' or 'regression'.")
+            msg = "problem must be 'classification' or 'regression'."
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
         if target not in df.columns:
-            self._send_message(kernel, "stderr", f"Target column '{target}' not found in DataFrame.")
+            msg = f"Target column '{target}' not found in DataFrame."
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns="",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
         # Parse features or set to all columns except target if not provided
@@ -130,18 +385,60 @@ class MLPipeline(MariaMagic):
             elif isinstance(features_arg, (list, tuple)):
                 features = list(features_arg)
             else:
-                self._send_message(kernel, "stderr", "features must be comma-separated string or list.")
+                msg = "features must be comma-separated string or list."
+                self._send_message(kernel, "stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=self.args if isinstance(self.args, str) else str(self.args),
+                        affected_columns="",
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return False
         else:
             features = [col for col in df.columns if col != target]
             if not features:
-                self._send_message(kernel, "stderr", "No features available after excluding target column.")
+                msg = "No features available after excluding target column."
+                self._send_message(kernel, "stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=self.args if isinstance(self.args, str) else str(self.args),
+                        affected_columns="",
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return False
 
         # Validate features
         missing = [c for c in features if c not in df.columns]
         if missing:
-            self._send_message(kernel, "stderr", f"Missing feature columns in DataFrame: {', '.join(missing)}")
+            msg = f"Missing feature columns in DataFrame: {', '.join(missing)}"
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(features),
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
         # Set defaults
@@ -174,12 +471,40 @@ class MLPipeline(MariaMagic):
             DropMissing(drop_args).execute(kernel, data)
             cur_df = data.get("last_select")
             if cur_df is None or cur_df.empty:
-                self._send_message(kernel, "stderr", "DataFrame is empty after dropping missing values.")
+                msg = "DataFrame is empty after dropping missing values."
+                self._send_message(kernel, "stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=drop_args,
+                        affected_columns=",".join(features),
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return False
             # Refresh working_df reference after cleaning
             working_df = cur_df
         except Exception as e:
-            self._send_message(kernel, "stderr", f"Error handling missing values: {e}")
+            msg = f"Error handling missing values: {e}"
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(features) if 'features' in locals() else "",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
         # Step 2: Encode categorical features
@@ -187,7 +512,7 @@ class MLPipeline(MariaMagic):
             # Recompute cat_columns on current working_df
             cat_columns = [c for c in features if c in working_df.columns and working_df[c].dtype in ["object", "category"]]
             if cat_columns:
-                encode_args = f"method={encode_method} columns={','.join(cat_columns)} inplace=True drop_original=True"
+                encode_args = f"method={encode_method} columns={','.join(cat_columns)} inplace=True drop_original=True mode=apply confirm=true"
                 # reset any previous encoder
                 data["last_select_encoder"] = None
                 Encode(encode_args).execute(kernel, data)
@@ -198,7 +523,21 @@ class MLPipeline(MariaMagic):
                 if encode_method == "onehot":
                     encoder = data.get("last_select_encoder")
                     if not encoder:
-                        self._send_message(kernel, "stderr", "Encoder not found after encoding. Ensure %encode saves the encoder to data['last_select_encoder'].")
+                        msg = "Encoder not found after encoding. Ensure %encode saves the encoder to data['last_select_encoder']."
+                        self._send_message(kernel, "stderr", msg)
+                        try:
+                            self._insert_metadata(
+                                kernel=kernel,
+                                command_name=self.name(),
+                                arguments=encode_args,
+                                affected_columns=",".join(cat_columns),
+                                operation_status="error",
+                                message=msg,
+                                db_name=db_name,
+                                user_name=user_name
+                            )
+                        except Exception:
+                            pass
                         return False
                     try:
                         # get_feature_names_out may require passing the original column names
@@ -222,7 +561,21 @@ class MLPipeline(MariaMagic):
                         feature_names = [str(fn) for fn in feature_names]
                         features = [c for c in features if c not in cat_columns] + feature_names
                     except Exception as e:
-                        self._send_message(kernel, "stderr", f"Failed to retrieve encoded feature names: {e}")
+                        msg = f"Failed to retrieve encoded feature names: {e}"
+                        self._send_message(kernel, "stderr", msg)
+                        try:
+                            self._insert_metadata(
+                                kernel=kernel,
+                                command_name=self.name(),
+                                arguments=encode_args,
+                                affected_columns=",".join(cat_columns),
+                                operation_status="error",
+                                message=msg,
+                                db_name=db_name,
+                                user_name=user_name
+                            )
+                        except Exception:
+                            pass
                         return False
 
                 elif encode_method == "label":
@@ -243,12 +596,40 @@ class MLPipeline(MariaMagic):
                     related_columns = []
                     for c in cat_columns:
                         related_columns += [col for col in working_df.columns if col.startswith(c + "_") or col.startswith(c + "_lbl") or col.startswith(c + "_ord")]
-                    self._send_message(kernel, "stderr", f"Encoded features not found in DataFrame: {', '.join(missing_encoded)}")
+                    msg = f"Encoded features not found in DataFrame: {', '.join(missing_encoded)}"
+                    self._send_message(kernel, "stderr", msg)
                     if related_columns:
                         self._send_message(kernel, "stderr", f"Available related columns: {', '.join(related_columns)}")
+                    try:
+                        self._insert_metadata(
+                            kernel=kernel,
+                            command_name=self.name(),
+                            arguments=encode_args,
+                            affected_columns=",".join(missing_encoded),
+                            operation_status="error",
+                            message=msg,
+                            db_name=db_name,
+                            user_name=user_name
+                        )
+                    except Exception:
+                        pass
                     return False
         except Exception as e:
-            self._send_message(kernel, "stderr", f"Error during encoding: {e}")
+            msg = f"Error during encoding: {e}"
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(features) if 'features' in locals() else "",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
         # Step 3: Feature selection (if features not provided)
@@ -258,16 +639,58 @@ class MLPipeline(MariaMagic):
                 SelectFeatures(select_features_args).execute(kernel, data)
                 features = data.get("selected_features", [])
                 if not features:
-                    self._send_message(kernel, "stderr", "Feature selection failed to return features.")
+                    msg = "Feature selection failed to return features."
+                    self._send_message(kernel, "stderr", msg)
+                    try:
+                        self._insert_metadata(
+                            kernel=kernel,
+                            command_name=self.name(),
+                            arguments=select_features_args,
+                            affected_columns="",
+                            operation_status="error",
+                            message=msg,
+                            db_name=db_name,
+                            user_name=user_name
+                        )
+                    except Exception:
+                        pass
                     return False
                 # Verify selected features exist
                 working_df = data.get("last_select", working_df)
                 missing_features = [f for f in features if f not in working_df.columns]
                 if missing_features:
-                    self._send_message(kernel, "stderr", f"Selected features not found in DataFrame: {', '.join(missing_features)}")
+                    msg = f"Selected features not found in DataFrame: {', '.join(missing_features)}"
+                    self._send_message(kernel, "stderr", msg)
+                    try:
+                        self._insert_metadata(
+                            kernel=kernel,
+                            command_name=self.name(),
+                            arguments=select_features_args,
+                            affected_columns=",".join(missing_features),
+                            operation_status="error",
+                            message=msg,
+                            db_name=db_name,
+                            user_name=user_name
+                        )
+                    except Exception:
+                        pass
                     return False
             except Exception as e:
-                self._send_message(kernel, "stderr", f"Error during feature selection: {e}")
+                msg = f"Error during feature selection: {e}"
+                self._send_message(kernel, "stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=self.args if isinstance(self.args, str) else str(self.args),
+                        affected_columns=",".join(features) if 'features' in locals() else "",
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return False
 
         # Step 4: Scale numeric features
@@ -278,10 +701,23 @@ class MLPipeline(MariaMagic):
                 scale_args = f"columns={','.join(num_columns)} inplace=True"
                 Standardize(scale_args).execute(kernel, data)
         except Exception as e:
-            self._send_message(kernel, "stderr", f"Error during scaling: {e}")
+            msg = f"Error during scaling: {e}"
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=scale_args if 'scale_args' in locals() else (self.args if isinstance(self.args, str) else str(self.args)),
+                    affected_columns=",".join(num_columns) if 'num_columns' in locals() else (",".join(features) if 'features' in locals() else ""),
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
-        # Step 5: Split data
         # Step 5: Split data
         try:
             split_args = f"test_size={test_size} val_size={val_size} shuffle={shuffle} " \
@@ -298,11 +734,39 @@ class MLPipeline(MariaMagic):
             test_df = data.get(test_name)
 
             if train_df is None or train_df.empty or test_df is None or test_df.empty:
-                self._send_message(kernel, "stderr", "Data splitting failed to produce non-empty train/test sets.")
+                msg = "Data splitting failed to produce non-empty train/test sets."
+                self._send_message(kernel, "stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=split_args,
+                        affected_columns=",".join(features) if 'features' in locals() else "",
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return False
 
         except Exception as e:
-            self._send_message(kernel, "stderr", f"Error during data splitting: {e}")
+            msg = f"Error during data splitting: {e}"
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=split_args if 'split_args' in locals() else (self.args if isinstance(self.args, str) else str(self.args)),
+                    affected_columns=",".join(features) if 'features' in locals() else "",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
         # Step 6: Model selection or training
@@ -327,14 +791,39 @@ class MLPipeline(MariaMagic):
             # Validate model creation
             model_obj = data.get(model_store_name)
             if model_obj is None:
-                self._send_message(
-                    kernel, "stderr",
-                    f"No model object created. Ensure SelectModel or TrainModel supports problem='{problem}'."
-                )
+                msg = f"No model object created. Ensure SelectModel or TrainModel supports problem='{problem}'."
+                self._send_message(kernel, "stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=self.args if isinstance(self.args, str) else str(self.args),
+                        affected_columns=",".join(features) if 'features' in locals() else "",
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return False
 
         except Exception as e:
-            self._send_message(kernel, "stderr", f"Error during model training/selection: {e}")
+            msg = f"Error during model training/selection: {e}"
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(features) if 'features' in locals() else "",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
         # Step 7: Evaluate model
@@ -342,25 +831,86 @@ class MLPipeline(MariaMagic):
             eval_args = f"model_name={model_store_name} test_name={test_name} problem={problem}"
             EvaluateModel(eval_args).execute(kernel, data)
         except Exception as e:
-            self._send_message(kernel, "stderr", f"Error during model evaluation: {e}")
+            msg = f"Error during model evaluation: {e}"
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=eval_args if 'eval_args' in locals() else (self.args if isinstance(self.args, str) else str(self.args)),
+                    affected_columns=",".join(features) if 'features' in locals() else "",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
-        # Step 8: Save model if requested
         # Step 8: Save model if requested
         if save_path:
             try:
                 # Ensure correct key for SaveModel command
-                save_args = f"model_name={model_store_name} save_path={save_path}"
+                save_args = f"model_name_in_data={model_store_name} save_path={save_path}"
                 SaveModel(save_args).execute(kernel, data)
                 self._send_message(kernel, "stdout", f"Model saved to {save_path}.")
             except Exception as e:
-                self._send_message(kernel, "stderr", f"Error saving model: {e}")
+                msg = f"Error saving model: {e}"
+                self._send_message(kernel, "stderr", msg)
+                try:
+                    self._insert_metadata(
+                        kernel=kernel,
+                        command_name=self.name(),
+                        arguments=save_args if 'save_args' in locals() else (self.args if isinstance(self.args, str) else str(self.args)),
+                        affected_columns=model_store_name,
+                        operation_status="error",
+                        message=msg,
+                        db_name=db_name,
+                        user_name=user_name
+                    )
+                except Exception:
+                    pass
                 return False
         else:
-            self._send_message(kernel, "stderr", "You must provide save_path=/path/to/file.joblib")
+            msg = "You must provide save_path=/path/to/file.joblib"
+            self._send_message(kernel, "stderr", msg)
+            try:
+                self._insert_metadata(
+                    kernel=kernel,
+                    command_name=self.name(),
+                    arguments=self.args if isinstance(self.args, str) else str(self.args),
+                    affected_columns=",".join(features) if 'features' in locals() else "",
+                    operation_status="error",
+                    message=msg,
+                    db_name=db_name,
+                    user_name=user_name
+                )
+            except Exception:
+                pass
             return False
 
+        # Summary and success metadata
+        success_msg = "ML pipeline completed successfully."
+        self._send_message(kernel, "stdout", success_msg)
+        try:
+            args_for_db = self.args if isinstance(self.args, str) else str(self.args)
+            affected_columns_str = ",".join(features) if 'features' in locals() else ""
+            message_str = f"{success_msg} model={model_store_name} saved_to={save_path}"
+            self._insert_metadata(
+                kernel=kernel,
+                command_name=self.name(),
+                arguments=args_for_db,
+                affected_columns=affected_columns_str,
+                operation_status="success",
+                message=message_str,
+                db_name=db_name,
+                user_name=user_name
+            )
+        except Exception:
+            try:
+                self._send_message(kernel, "stdout", "Warning: failed to write metadata (continuing).")
+            except Exception:
+                pass
 
-        # Summary
-        self._send_message(kernel, "stdout", "ML pipeline completed successfully.")
         return True

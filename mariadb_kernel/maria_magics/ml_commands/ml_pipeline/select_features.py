@@ -186,7 +186,10 @@ class SelectFeatures(MariaMagic):
             operation_status VARCHAR(50),
             message TEXT,
             db_name VARCHAR(255),
-            user_name VARCHAR(255)
+            user_name VARCHAR(255),
+            rollback_token VARCHAR(255),
+            backup_table VARCHAR(255),
+            original_table VARCHAR(255)
         );
         """
         try:
@@ -402,7 +405,7 @@ class SelectFeatures(MariaMagic):
                     kernel=kernel,
                     command_name=self.name(),
                     arguments=self.args if isinstance(self.args, str) else str(self.args),
-                    affected_columns=",".join(features),
+                    affected_columns="\n".join(features),
                     operation_status="error",
                     message=msg,
                     db_name=db_name,
@@ -420,7 +423,7 @@ class SelectFeatures(MariaMagic):
                     kernel=kernel,
                     command_name=self.name(),
                     arguments=self.args if isinstance(self.args, str) else str(self.args),
-                    affected_columns=",".join(features),
+                    affected_columns="\n".join(features),
                     operation_status="error",
                     message=msg,
                     db_name=db_name,
@@ -443,7 +446,7 @@ class SelectFeatures(MariaMagic):
                         kernel=kernel,
                         command_name=self.name(),
                         arguments=self.args if isinstance(self.args, str) else str(self.args),
-                        affected_columns=",".join(features),
+                        affected_columns="\n".join(features),
                         operation_status="error",
                         message=msg,
                         db_name=db_name,
@@ -509,7 +512,7 @@ class SelectFeatures(MariaMagic):
                             kernel=kernel,
                             command_name=self.name(),
                             arguments=self.args if isinstance(self.args, str) else str(self.args),
-                            affected_columns=",".join(features),
+                            affected_columns="\n".join(features),
                             operation_status="error",
                             message=msg,
                             db_name=db_name,
@@ -526,7 +529,7 @@ class SelectFeatures(MariaMagic):
                             kernel=kernel,
                             command_name=self.name(),
                             arguments=self.args if isinstance(self.args, str) else str(self.args),
-                            affected_columns=",".join(features),
+                            affected_columns="\n".join(features),
                             operation_status="error",
                             message=msg,
                             db_name=db_name,
@@ -587,7 +590,7 @@ class SelectFeatures(MariaMagic):
                         kernel=kernel,
                         command_name=self.name(),
                         arguments=self.args if isinstance(self.args, str) else str(self.args),
-                        affected_columns=",".join(features),
+                        affected_columns="\n".join(features),
                         operation_status="error",
                         message=msg,
                         db_name=db_name,
@@ -605,7 +608,7 @@ class SelectFeatures(MariaMagic):
                     kernel=kernel,
                     command_name=self.name(),
                     arguments=self.args if isinstance(self.args, str) else str(self.args),
-                    affected_columns=",".join(features),
+                    affected_columns="\n".join(features),
                     operation_status="error",
                     message=msg,
                     db_name=db_name,
@@ -633,7 +636,7 @@ class SelectFeatures(MariaMagic):
                     kernel=kernel,
                     command_name=self.name(),
                     arguments=self.args if isinstance(self.args, str) else str(self.args),
-                    affected_columns=",".join(selected_features) if 'selected_features' in locals() else "",
+                    affected_columns="\n".join(selected_features) if 'selected_features' in locals() else "",
                     operation_status="error",
                     message=msg,
                     db_name=db_name,
@@ -655,7 +658,7 @@ class SelectFeatures(MariaMagic):
         # Insert metadata (best-effort)
         try:
             args_for_db = self.args if isinstance(self.args, str) else str(self.args)
-            affected_columns_str = ",".join(selected_features)
+            affected_columns_str = "\n".join(selected_features)
             message_str = success_msg
             self._insert_metadata(
                 kernel=kernel,

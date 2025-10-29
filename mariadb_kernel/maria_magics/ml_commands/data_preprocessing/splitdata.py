@@ -175,7 +175,10 @@ class SplitData(MariaMagic):
             operation_status VARCHAR(50),
             message TEXT,
             db_name VARCHAR(255),
-            user_name VARCHAR(255)
+            user_name VARCHAR(255),
+            rollback_token VARCHAR(255),
+            backup_table VARCHAR(255),
+            original_table VARCHAR(255)
         );
         """
         try:

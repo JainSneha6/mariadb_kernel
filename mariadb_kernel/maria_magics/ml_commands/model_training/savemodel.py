@@ -5,7 +5,7 @@ import time
 from distutils import util
 import logging
 from mariadb_kernel.maria_magics.maria_magic import MariaMagic
-
+import os
 
 def _str_to_obj(s):
     try:
@@ -68,6 +68,8 @@ class SaveModel(MariaMagic):
         save_path = args.get("save_path")
         overwrite = bool(args.get("overwrite", False))
 
+        
+
         if not save_path:
             kernel._send_message("stderr", "You must provide save_path=/path/to/file.joblib")
             return
@@ -84,6 +86,7 @@ class SaveModel(MariaMagic):
             return
 
         try:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
             joblib.dump(model_obj, save_path)
             kernel._send_message("stdout", f"Model from data['{model_key}'] saved to {save_path}")
         except Exception as e:
