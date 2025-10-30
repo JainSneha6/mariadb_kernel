@@ -39,12 +39,22 @@ try:
 except Exception:
     get_ipython = None
 
+# Optional helper to reliably get current DB name (if available)
+try:
+    from mariadb_kernel.sql_fetch import SqlFetch
+except Exception:
+    SqlFetch = None
+
 
 class MariaIngest(MariaMagic):
     """
     Ingest text documents into MariaDB, chunk them, and store embeddings.
 
     This variant reduces noisy logging and prints only important status/warnings.
+
+    Added: metadata logging into magic_metadata table similar to TrainModel:
+      - Ensures magic_metadata exists in current database
+      - Inserts error/success rows for operations
     """
     def __init__(self, args=""):
         self.args = args
@@ -106,12 +116,164 @@ class MariaIngest(MariaMagic):
             pairs[k] = self._str_to_obj(v)
         return pairs
 
+    # NOTE: keep existing _sql_escape for SQL literals used in queries (returns unquoted for non-strings)
     def _sql_escape(self, s):
         if s is None:
             return "NULL"
         if not isinstance(s, str):
             return str(s)
         return "'" + s.replace("'", "''") + "'"
+
+    # Metadata helpers (copied/adapted from TrainModel to provide consistent metadata logging)
+    def _get_mariadb_client(self, kernel):
+        return getattr(kernel, "mariadb_client", None)
+
+    def _get_logger(self, kernel):
+        return getattr(kernel, "log", logging.getLogger(__name__))
+
+    def _sql_escape_meta(self, val):
+        """Escape a value for SQL single-quoted literal insert. None -> NULL"""
+        if val is None:
+            return "NULL"
+        if not isinstance(val, str):
+            val = str(val)
+        return "'" + val.replace("'", "''") + "'"
+
+    def _get_db_name(self, kernel):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+
+        # Try SqlFetch if available
+        if SqlFetch is not None and mariadb_client is not None:
+            try:
+                sf = SqlFetch(mariadb_client, log)
+                dbname = sf.get_db_name()
+                if isinstance(dbname, str):
+                    return dbname
+            except Exception:
+                log.debug("SqlFetch available but .get_db_name() failed; falling back.")
+
+        if mariadb_client is None:
+            return ""
+
+        try:
+            result = mariadb_client.run_statement("SELECT DATABASE();")
+            if mariadb_client.iserror() or not result:
+                return ""
+            # Try to parse HTML table with pandas if available
+            try:
+                import pandas as _pd  # local import to avoid global dependency
+                dfs = _pd.read_html(result)
+                if dfs and len(dfs) > 0:
+                    val = dfs[0].iloc[0, 0]
+                    if isinstance(val, float) and _pd.isna(val):
+                        return ""
+                    return str(val) if val is not None else ""
+            except Exception:
+                m = re.search(r"<td.*?>(.*?)</td>", str(result), flags=re.S | re.I)
+                if m:
+                    txt = re.sub(r"<.*?>", "", m.group(1)).strip()
+                    if txt.lower() == "null" or txt == "":
+                        return ""
+                    return txt
+                txt = str(result).strip()
+                if txt.lower() == "null" or txt == "":
+                    return ""
+                return txt
+        except Exception:
+            return ""
+        return ""
+
+    def _get_user_name(self, kernel):
+        candidates = [
+            getattr(kernel, "user_name", None),
+            getattr(kernel, "username", None),
+            getattr(kernel, "user", None),
+            getattr(kernel, "session", None),
+        ]
+        for cand in candidates:
+            if cand is None:
+                continue
+            if isinstance(cand, str) and cand.strip():
+                return cand
+            try:
+                maybe = getattr(cand, "user", None)
+                if isinstance(maybe, str) and maybe.strip():
+                    return maybe
+            except Exception:
+                pass
+        try:
+            return os.getlogin()
+        except Exception:
+            return ""
+
+    def _ensure_metadata_table(self, kernel, db_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS {table_full_name} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            command_name VARCHAR(255),
+            arguments TEXT,
+            execution_timestamp DATETIME,
+            affected_columns TEXT,
+            operation_status VARCHAR(50),
+            message TEXT,
+            db_name VARCHAR(255),
+            user_name VARCHAR(255),
+            rollback_token VARCHAR(255),
+            backup_table VARCHAR(255),
+            original_table VARCHAR(255)
+        );
+        """
+        try:
+            mariadb_client.run_statement(create_sql)
+            if mariadb_client.iserror():
+                log.error("Error creating magic_metadata table.")
+        except Exception as e:
+            log.error(f"Failed to ensure magic_metadata table: {e}")
+
+    def _insert_metadata(self, kernel, command_name, arguments, affected_columns,
+                         operation_status, message, db_name, user_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+
+        args_sql = self._sql_escape_meta(arguments)
+        affected_sql = self._sql_escape_meta(affected_columns)
+        status_sql = self._sql_escape_meta(operation_status)
+        message_sql = self._sql_escape_meta(message)
+        db_sql = self._sql_escape_meta(db_name)
+        user_sql = self._sql_escape_meta(user_name)
+
+        insert_sql = f"""
+        INSERT INTO {table_full_name}
+            (command_name, arguments, execution_timestamp, affected_columns,
+             operation_status, message, db_name, user_name)
+        VALUES (
+            {self._sql_escape_meta(command_name)},
+            {args_sql},
+            NOW(),
+            {affected_sql},
+            {status_sql},
+            {message_sql},
+            {db_sql},
+            {user_sql}
+        );
+        """
+        try:
+            mariadb_client.run_statement(insert_sql)
+            if mariadb_client.iserror():
+                log.error("Error inserting into magic_metadata.")
+        except Exception as e:
+            log.error(f"Exception while inserting metadata: {e}")
+
+    # ---- end metadata helpers ----
 
     def _simple_chunk(self, text: str, chunk_size: int, overlap: int):
         if not text:
@@ -308,6 +470,15 @@ class MariaIngest(MariaMagic):
             args = self.parse_args(self.args)
         except Exception as e:
             kernel._send_message("stderr", f"Error parsing arguments: {e}\n")
+            # attempt to write metadata about parse error if possible
+            try:
+                db_name = self._get_db_name(kernel)
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, db_name)
+                self._insert_metadata(kernel, self.name(), self.args, "", "error",
+                                      f"Error parsing arguments: {e}", db_name, user_name)
+            except Exception:
+                pass
             return
 
         # text arg or file arg preference
@@ -384,13 +555,25 @@ class MariaIngest(MariaMagic):
 
         docs_to_ingest = [d for d in docs_to_ingest if (d.get("content") or "").strip()]
         if not docs_to_ingest:
-            kernel._send_message("stderr", "No non-empty documents to ingest; aborting.\n")
+            msg = "No non-empty documents to ingest; aborting."
+            kernel._send_message("stderr", msg + "\n")
+            # write metadata error (best-effort)
+            try:
+                db_name = self._get_db_name(kernel)
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, db_name)
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", msg, db_name, user_name)
+            except Exception:
+                pass
             return
 
         # get mariadb client
         mariadb_client = getattr(kernel, "mariadb_client", None)
         if mariadb_client is None:
-            kernel._send_message("stderr", "No mariadb_client available on kernel (can't run ingestion).\n")
+            msg = "No mariadb_client available on kernel (can't run ingestion)."
+            kernel._send_message("stderr", msg + "\n")
+            # cannot write metadata without mariadb_client, so just return
             return
 
         # determine db
@@ -399,12 +582,40 @@ class MariaIngest(MariaMagic):
             dbname = self._parse_single_result(db_name_html) or ""
             kernel._send_message("stdout", f"Using database: {dbname}\n")
         except Exception as e:
-            kernel._send_message("stderr", f"Failed to query current database: {e}\n")
+            msg = f"Failed to query current database: {e}"
+            kernel._send_message("stderr", msg + "\n")
+            # try to write metadata
+            try:
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, "")
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", msg, "", user_name)
+            except Exception:
+                pass
             return
 
         if not dbname:
-            kernel._send_message("stderr", "No current database selected (use `USE <db>` before running the magic).\n")
+            msg = "No current database selected (use `USE <db>` before running the magic)."
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, dbname)
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", msg, dbname, user_name)
+            except Exception:
+                pass
             return
+
+        # Ensure metadata table exists for this database
+        try:
+            user_name = self._get_user_name(kernel)
+            self._ensure_metadata_table(kernel, dbname)
+        except Exception:
+            # non-fatal, continue; metadata will be best-effort later
+            try:
+                kernel._send_message("stdout", "Warning: failed to ensure metadata table (continuing).\n")
+            except Exception:
+                pass
 
         # create tables: documents, chunks; embeddings handled carefully
         try:
@@ -452,7 +663,13 @@ class MariaIngest(MariaMagic):
                 # tolerate create failure and continue (we'll detect existing table schema)
                 pass
         except Exception as e:
-            kernel._send_message("stderr", f"DDL failed: {e}\n")
+            msg = f"DDL failed: {e}"
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", msg, dbname, user_name)
+            except Exception:
+                pass
             return
 
         # detect existing VECTOR dimension (if any)
@@ -508,6 +725,12 @@ class MariaIngest(MariaMagic):
                 )
             except Exception as e:
                 user_warnings.append(f"Failed to insert document {d_doc_id}: {e}")
+                # Log per-document failure into metadata (best-effort)
+                try:
+                    self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                          f"doc_id={d_doc_id}", "error", f"Failed to insert document {d_doc_id}: {e}", dbname, user_name)
+                except Exception:
+                    pass
                 continue
 
             # chunk
@@ -546,6 +769,13 @@ class MariaIngest(MariaMagic):
                             inserted_chunk_ids.append((idx, None))
                 except Exception as e:
                     user_warnings.append(f"Failed to insert chunk {idx} for {d_doc_id}: {e}")
+                    # log per-chunk failure
+                    try:
+                        self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                              f"doc_id={d_doc_id},chunk_index={idx}", "error",
+                                              f"Failed to insert chunk {idx} for {d_doc_id}: {e}", dbname, user_name)
+                    except Exception:
+                        pass
                     inserted_chunk_ids.append((idx, None))
                     continue
 
@@ -559,6 +789,13 @@ class MariaIngest(MariaMagic):
                 for (i, chunk_db_id), vec in zip(inserted_chunk_ids, embs_norm):
                     if chunk_db_id is None:
                         user_warnings.append(f"No chunk id for doc {d_doc_id} chunk {i}; embedding skipped.")
+                        # log skipped embedding
+                        try:
+                            self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                  f"doc_id={d_doc_id},chunk_index={i}", "error",
+                                                  "No chunk id for embedding; skipped", dbname, user_name)
+                        except Exception:
+                            pass
                         continue
 
                     vec_list = [float(v) for v in vec.tolist()]
@@ -586,11 +823,27 @@ class MariaIngest(MariaMagic):
                                     total_emb_rows += 1
                                 else:
                                     fallback_failures += 1
+                                    # log failure
+                                    self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                          f"chunk_id={chunk_db_id}", "error",
+                                                          "Fallback JSON embedding write returned zero rows", dbname, user_name)
                             except Exception:
                                 fallback_failures += 1
+                                try:
+                                    self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                          f"chunk_id={chunk_db_id}", "error",
+                                                          "Fallback JSON embedding verification failed", dbname, user_name)
+                                except Exception:
+                                    pass
                         except Exception as e_json:
                             user_warnings.append(f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}")
                             fallback_failures += 1
+                            try:
+                                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                      f"chunk_id={chunk_db_id}", "error",
+                                                      f"Fallback embedding storage failed: {e_json}", dbname, user_name)
+                            except Exception:
+                                pass
                         continue
 
                     # Attempt native VECTOR insert
@@ -630,6 +883,19 @@ class MariaIngest(MariaMagic):
                         except Exception as e_json:
                             user_warnings.append(f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}")
                             fallback_failures += 1
+                            try:
+                                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                      f"chunk_id={chunk_db_id}", "error",
+                                                      f"Fallback storage after native failure also failed: {e_json}", dbname, user_name)
+                            except Exception:
+                                pass
+                        # log native failure
+                        try:
+                            self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                  f"chunk_id={chunk_db_id}", "error",
+                                                  f"Native vector insert failed: {e_native}", dbname, user_name)
+                        except Exception:
+                            pass
                         continue
 
                     # Verify native insert succeeded by COUNT(*)
@@ -663,13 +929,28 @@ class MariaIngest(MariaMagic):
                                         total_emb_rows += 1
                                     else:
                                         fallback_failures += 1
+                                        self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                              f"chunk_id={chunk_db_id}", "error",
+                                                              "Fallback JSON write after native verify returned zero rows", dbname, user_name)
                                 except Exception:
                                     fallback_failures += 1
                             except Exception as e_json:
                                 user_warnings.append(f"Fallback embedding storage failed for chunk_id={chunk_db_id}: {e_json}")
                                 fallback_failures += 1
+                                try:
+                                    self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                          f"chunk_id={chunk_db_id}", "error",
+                                                          f"Fallback JSON storage after native verify failed: {e_json}", dbname, user_name)
+                                except Exception:
+                                    pass
                     except Exception as e_verify:
                         user_warnings.append(f"Verify select for embeddings failed: {e_verify}")
+                        try:
+                            self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                                  f"chunk_id={chunk_db_id}", "error",
+                                                  f"Verify select for embeddings failed: {e_verify}", dbname, user_name)
+                        except Exception:
+                            pass
 
         # Final diagnostics: counts & version
         try:
@@ -689,17 +970,36 @@ class MariaIngest(MariaMagic):
             version_val = ""
 
         # concise output
-        kernel._send_message("stdout", (
+        summary_msg = (
             "Ingest complete.\n"
             f" documents={len(docs_to_ingest)}\n"
             f" chunks_total={total_chunks}\n"
             f" embeddings_written={total_emb_rows}\n"
             f" Server version: {version_val}\n"
-        ))
+        )
+        kernel._send_message("stdout", summary_msg)
 
-        # if user_warnings:
-        #     kernel._send_message("stderr", "Warnings/notes:\n")
-        #     for w in user_warnings:
-        #         kernel._send_message("stderr", f" - {w}\n")
+        # write success metadata (best-effort)
+        try:
+            args_for_db = self.args if isinstance(self.args, str) else str(self.args)
+            affected_columns_str = "documents,chunks,embeddings"
+            self._insert_metadata(kernel, self.name(), args_for_db, affected_columns_str,
+                                  "success", summary_msg, dbname, user_name)
+        except Exception:
+            try:
+                kernel._send_message("stdout", "Warning: failed to write metadata (continuing).\n")
+            except Exception:
+                pass
+
+        # optionally show warnings
+        if user_warnings:
+            try:
+                for w in user_warnings:
+                    try:
+                       pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         return

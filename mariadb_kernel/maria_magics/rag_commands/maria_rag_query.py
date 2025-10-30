@@ -48,6 +48,13 @@ try:
 except Exception:
     _GENAI_AVAILABLE = False
 
+# Optional helper to reliably get current DB name (if available)
+try:
+    from mariadb_kernel.sql_fetch import SqlFetch
+except Exception:
+    SqlFetch = None
+
+
 class MariaRAGQuery(MariaMagic):
     def __init__(self, args=""):
         self.args = args
@@ -124,6 +131,155 @@ class MariaRAGQuery(MariaMagic):
         if not isinstance(s, str):
             return str(s)
         return "'" + s.replace("'", "''") + "'"
+
+    # ---------------- Metadata helpers (added) ----------------
+    def _get_mariadb_client(self, kernel):
+        return getattr(kernel, "mariadb_client", None)
+
+    def _get_logger(self, kernel):
+        return getattr(kernel, "log", logging.getLogger(__name__))
+
+    def _sql_escape_meta(self, val):
+        """Escape a value for SQL single-quoted literal insert. None -> NULL"""
+        if val is None:
+            return "NULL"
+        if not isinstance(val, str):
+            val = str(val)
+        return "'" + val.replace("'", "''") + "'"
+
+    def _get_db_name(self, kernel):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+
+        # Try SqlFetch if available
+        if SqlFetch is not None and mariadb_client is not None:
+            try:
+                sf = SqlFetch(mariadb_client, log)
+                dbname = sf.get_db_name()
+                if isinstance(dbname, str):
+                    return dbname
+            except Exception:
+                log.debug("SqlFetch available but .get_db_name() failed; falling back.")
+
+        if mariadb_client is None:
+            return ""
+
+        try:
+            result = mariadb_client.run_statement("SELECT DATABASE();")
+            if mariadb_client.iserror() or not result:
+                return ""
+            # Try to parse HTML table with pandas if available
+            try:
+                import pandas as _pd  # local import to avoid global dependency
+                dfs = _pd.read_html(result)
+                if dfs and len(dfs) > 0:
+                    val = dfs[0].iloc[0, 0]
+                    if isinstance(val, float) and _pd.isna(val):
+                        return ""
+                    return str(val) if val is not None else ""
+            except Exception:
+                m = re.search(r"<td.*?>(.*?)</td>", str(result), flags=re.S | re.I)
+                if m:
+                    txt = re.sub(r"<.*?>", "", m.group(1)).strip()
+                    if txt.lower() == "null" or txt == "":
+                        return ""
+                    return txt
+                txt = str(result).strip()
+                if txt.lower() == "null" or txt == "":
+                    return ""
+                return txt
+        except Exception:
+            return ""
+        return ""
+
+    def _get_user_name(self, kernel):
+        candidates = [
+            getattr(kernel, "user_name", None),
+            getattr(kernel, "username", None),
+            getattr(kernel, "user", None),
+            getattr(kernel, "session", None),
+        ]
+        for cand in candidates:
+            if cand is None:
+                continue
+            if isinstance(cand, str) and cand.strip():
+                return cand
+            try:
+                maybe = getattr(cand, "user", None)
+                if isinstance(maybe, str) and maybe.strip():
+                    return maybe
+            except Exception:
+                pass
+        try:
+            return os.getlogin()
+        except Exception:
+            return ""
+
+    def _ensure_metadata_table(self, kernel, db_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+        create_sql = f"""
+        CREATE TABLE IF NOT EXISTS {table_full_name} (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            command_name VARCHAR(255),
+            arguments TEXT,
+            execution_timestamp DATETIME,
+            affected_columns TEXT,
+            operation_status VARCHAR(50),
+            message TEXT,
+            db_name VARCHAR(255),
+            user_name VARCHAR(255),
+            rollback_token VARCHAR(255),
+            backup_table VARCHAR(255),
+            original_table VARCHAR(255)
+        );
+        """
+        try:
+            mariadb_client.run_statement(create_sql)
+            if mariadb_client.iserror():
+                log.error("Error creating magic_metadata table.")
+        except Exception as e:
+            log.error(f"Failed to ensure magic_metadata table: {e}")
+
+    def _insert_metadata(self, kernel, command_name, arguments, affected_columns,
+                         operation_status, message, db_name, user_name):
+        mariadb_client = self._get_mariadb_client(kernel)
+        log = self._get_logger(kernel)
+        if mariadb_client is None:
+            return
+        table_full_name = f"{db_name}.magic_metadata" if db_name else "magic_metadata"
+
+        args_sql = self._sql_escape_meta(arguments)
+        affected_sql = self._sql_escape_meta(affected_columns)
+        status_sql = self._sql_escape_meta(operation_status)
+        message_sql = self._sql_escape_meta(message)
+        db_sql = self._sql_escape_meta(db_name)
+        user_sql = self._sql_escape_meta(user_name)
+
+        insert_sql = f"""
+        INSERT INTO {table_full_name}
+            (command_name, arguments, execution_timestamp, affected_columns,
+             operation_status, message, db_name, user_name)
+        VALUES (
+            {self._sql_escape_meta(command_name)},
+            {args_sql},
+            NOW(),
+            {affected_sql},
+            {status_sql},
+            {message_sql},
+            {db_sql},
+            {user_sql}
+        );
+        """
+        try:
+            mariadb_client.run_statement(insert_sql)
+            if mariadb_client.iserror():
+                log.error("Error inserting into magic_metadata.")
+        except Exception as e:
+            log.error(f"Exception while inserting metadata: {e}")
 
     # ---------------- Embedding utilities ----------------
     def _embed_texts(self, texts, dim=None):
@@ -356,7 +512,8 @@ class MariaRAGQuery(MariaMagic):
             self.log.debug("google.genai not available in environment.")
             return None, None
 
-        api_key = "AIzaSyBW1n6kIu0o-W3l0-pMBOMc4nzjYfsbETg"
+        # NOTE: in the snippet provided earlier an API key was hardcoded; here we'll check env vars.
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GENAI_API_KEY") or ""
         if not api_key:
             self.log.debug("No GENAI API key found in GOOGLE_API_KEY or GENAI_API_KEY.")
             return None, None
@@ -453,6 +610,15 @@ class MariaRAGQuery(MariaMagic):
             args = self.parse_args(self.args)
         except Exception as e:
             kernel._send_message("stderr", f"Error parsing arguments: {e}\n")
+            # best-effort metadata log
+            try:
+                dbname = self._get_db_name(kernel)
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, dbname)
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", f"Error parsing arguments: {e}", dbname, user_name)
+            except Exception:
+                pass
             args = {}
 
         query = None
@@ -462,7 +628,16 @@ class MariaRAGQuery(MariaMagic):
             if isinstance(data, str) and data.strip():
                 query = data.strip()
         if not query:
-            kernel._send_message("stderr", "No query supplied. Usage: %maria_rag_query query=\"...\"\n")
+            msg = "No query supplied. Usage: %maria_rag_query query=\"...\""
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                dbname = self._get_db_name(kernel)
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, dbname)
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", msg, dbname, user_name)
+            except Exception:
+                pass
             return
 
         explain = False
@@ -471,9 +646,20 @@ class MariaRAGQuery(MariaMagic):
                 explain = True
 
         kernel._send_message("stdout", f"[debug] RAG query received (len={len(query)}): {query}\n")
+
         mariadb_client = getattr(kernel, "mariadb_client", None)
         if mariadb_client is None:
-            kernel._send_message("stderr", "No mariadb_client available on kernel (can't run retrieval).\n")
+            msg = "No mariadb_client available on kernel (can't run retrieval)."
+            kernel._send_message("stderr", msg + "\n")
+            # metadata best-effort: cannot insert without client, but attempt helper which will no-op
+            try:
+                dbname = self._get_db_name(kernel)
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, dbname)
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", msg, dbname, user_name)
+            except Exception:
+                pass
             return
 
         # determine DB
@@ -489,33 +675,95 @@ class MariaRAGQuery(MariaMagic):
                 if m:
                     dbname = m.group(1).strip()
         except Exception as e:
-            kernel._send_message("stderr", f"Failed to detect current DB: {e}\n")
+            msg = f"Failed to detect current DB: {e}"
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, "")
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", msg, "", user_name)
+            except Exception:
+                pass
             return
 
         if not dbname:
-            kernel._send_message("stderr", "No current database selected (use `USE <db>` before running the magic).\n")
+            msg = "No current database selected (use `USE <db>` before running the magic)."
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                user_name = self._get_user_name(kernel)
+                self._ensure_metadata_table(kernel, dbname)
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "", "error", msg, dbname, user_name)
+            except Exception:
+                pass
             return
+
+        # Ensure metadata table exists for this database (best-effort)
+        try:
+            user_name = self._get_user_name(kernel)
+            self._ensure_metadata_table(kernel, dbname)
+        except Exception:
+            try:
+                kernel._send_message("stdout", "Warning: failed to ensure metadata table (continuing).\n")
+            except Exception:
+                pass
 
         # RETRIEVAL: BM25 prefilter (hybrid)
         candidates = []
-        if self.RETRIEVER == "hybrid":
-            candidates = self._bm25_prefilter(kernel, dbname, query)
+        try:
+            if self.RETRIEVER == "hybrid":
+                candidates = self._bm25_prefilter(kernel, dbname, query)
+        except Exception:
+            candidates = []
         if not candidates:
             candidates = self._sample_candidates(kernel, dbname)
         if not candidates:
-            kernel._send_message("stderr", "No candidate chunks found (chunks table empty?).\n")
+            msg = "No candidate chunks found (chunks table empty?)."
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "chunks", "error", msg, dbname, user_name)
+            except Exception:
+                pass
             return
 
         candidate_ids = [c["chunk_id"] for c in candidates if c.get("chunk_id") is not None]
         emb_map = self._fetch_embeddings_for_candidates(kernel, dbname, candidate_ids)
         if not emb_map:
-            kernel._send_message("stderr", "No embeddings found for any candidate chunks.\n")
+            msg = "No embeddings found for any candidate chunks."
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "embeddings", "error", msg, dbname, user_name)
+            except Exception:
+                pass
             return
 
         # compute query embedding consistent with vector dim
-        first_vec = next(iter(emb_map.values()))["vec"]
-        vec_dim = first_vec.shape[0]
-        q_emb = self._embed_texts([query], dim=vec_dim)[0]
+        try:
+            first_vec = next(iter(emb_map.values()))["vec"]
+            vec_dim = first_vec.shape[0]
+        except Exception:
+            msg = "Failed to determine embedding dimensionality."
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "embeddings", "error", msg, dbname, user_name)
+            except Exception:
+                pass
+            return
+
+        try:
+            q_emb = self._embed_texts([query], dim=vec_dim)[0]
+        except Exception as e:
+            msg = f"Failed to compute query embedding: {e}"
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "embeddings", "error", msg, dbname, user_name)
+            except Exception:
+                pass
+            return
 
         # combine bm25 + vector
         scored = []
@@ -541,7 +789,13 @@ class MariaRAGQuery(MariaMagic):
             })
 
         if not scored:
-            kernel._send_message("stderr", "No scored candidates after combining BM25/vector.\n")
+            msg = "No scored candidates after combining BM25/vector."
+            kernel._send_message("stderr", msg + "\n")
+            try:
+                self._insert_metadata(kernel, self.name(), self.args if isinstance(self.args, str) else str(self.args),
+                                      "search", "error", msg, dbname, user_name)
+            except Exception:
+                pass
             return
 
         # top-K
@@ -579,11 +833,13 @@ class MariaRAGQuery(MariaMagic):
             llm_raw_resp = gemini_raw
 
         chain_debug = None
+        used_llm = False
         if not llm_answer:
             ans, evidence, debug = self._fusion_chain_local(query, context_blocks)
             chain_debug = debug
-            # **DO NOT** append sources to the answer (per request)
             llm_answer = ans
+        else:
+            used_llm = True
 
         # Output answer only (no sources printed)
         kernel._send_message("stdout", "\n=== ANSWER ===\n")
@@ -601,5 +857,18 @@ class MariaRAGQuery(MariaMagic):
             if llm_raw_resp is not None:
                 kernel._send_message("stdout", "\n=== GEMINI RAW RESP (truncated) ===\n")
                 kernel._send_message("stdout", str(llm_raw_resp)[:2000] + "\n")
+
+        # write success metadata (best-effort)
+        try:
+            args_for_db = self.args if isinstance(self.args, str) else str(self.args)
+            affected_columns_str = "chunks,embeddings,llm" if used_llm else "chunks,embeddings,local_chain"
+            msg = f"Returned {len(topk)} results for query. used_llm={used_llm}"
+            self._insert_metadata(kernel, self.name(), args_for_db, affected_columns_str,
+                                  "success", msg, dbname, user_name)
+        except Exception:
+            try:
+                kernel._send_message("stdout", "Warning: failed to write metadata (continuing).\n")
+            except Exception:
+                pass
 
         return
