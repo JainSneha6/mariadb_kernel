@@ -573,7 +573,34 @@ class ClipOutliers(MariaMagic):
                         cols = [c for c, lower, upper, _ in combined_info if lower is not None and upper is not None and (pd.notna(r.get(c)) and (r.get(c) < lower or r.get(c) > upper))]
                         return ",".join(cols)
                     sample_rows["_oob_columns"] = sample_rows.apply(oob_cols, axis=1)
+
+                    # ADD: compute and show clipped preview columns for visibility
+                    for c, lower, upper, _ in combined_info:
+                        clipped_col_name = f"{c}_clipped_preview"
+                        try:
+                            if lower is None and upper is None:
+                                # no computed bounds; copy original values
+                                sample_rows[clipped_col_name] = sample_rows[c]
+                            else:
+                                # use pandas clip to compute what the value would be after clipping
+                                sample_rows[clipped_col_name] = sample_rows[c].clip(lower=lower, upper=upper)
+                        except Exception:
+                            # fallback: try elementwise clipping to avoid exceptions on mixed types
+                            def _clip_val(v):
+                                try:
+                                    if pd.isna(v):
+                                        return v
+                                    if lower is not None and v < lower:
+                                        return lower
+                                    if upper is not None and v > upper:
+                                        return upper
+                                    return v
+                                except Exception:
+                                    return v
+                            sample_rows[clipped_col_name] = sample_rows[c].apply(_clip_val)
+
                     try:
+                        # prefer HTML display; this will include the *_clipped_preview columns
                         self._send_html(kernel, sample_rows)
                     except Exception:
                         kernel._send_message("stdout", str(sample_rows.head()))
@@ -627,7 +654,7 @@ class ClipOutliers(MariaMagic):
             except Exception as e:
                 kernel._send_message("stderr", f"Error during preview: {e}")
             return
-
+        
         # --- ROLLBACK MODE ---
         if mode == "rollback":
             if mariadb_client is None:

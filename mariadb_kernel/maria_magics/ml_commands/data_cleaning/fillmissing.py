@@ -536,6 +536,29 @@ class FillMissing(MariaMagic):
                         return ",".join([c for c in target_columns if pd.isnull(r.get(c))])
                     sample_preview = sample_rows.copy()
                     sample_preview["_null_columns"] = sample_preview.apply(nulls_in_row, axis=1)
+
+                    # --- NEW: compute filled-preview columns so the user can see what values would be used ---
+                    for c in target_columns:
+                        filled_col = f"{c}_filled_preview"
+                        ok, fill_val, _ = computed.get(c, (False, None, ""))
+                        try:
+                            if ok and fill_val is not None:
+                                # use pandas fillna on the preview sample to show the to-be-filled value
+                                sample_preview[filled_col] = sample_preview[c].fillna(fill_val)
+                            else:
+                                # no computed fill value: show original values so preview is still informative
+                                sample_preview[filled_col] = sample_preview[c]
+                        except Exception:
+                            # fallback elementwise: preserve original when something goes wrong
+                            def _fill_elem(v):
+                                try:
+                                    if pd.isna(v) and ok and fill_val is not None:
+                                        return fill_val
+                                    return v
+                                except Exception:
+                                    return v
+                            sample_preview[filled_col] = sample_preview[c].apply(_fill_elem)
+
                     try:
                         self._send_html(kernel, sample_preview)
                     except Exception:
